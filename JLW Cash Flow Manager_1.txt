@@ -1,0 +1,1852 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { initializeApp, getApps } from 'firebase/app';
+import { getAuth, onAuthStateChanged, signInAnonymously } from 'firebase/auth';
+import { getFirestore, doc, setDoc, getDoc, collection, onSnapshot, addDoc, deleteDoc, query, updateDoc, writeBatch } from 'firebase/firestore';
+import { Store, Users, Clock, Settings as SettingsIcon, Trash2, PlusCircle, Download, Truck, BarChart2, Wallet, ChevronLeft, ChevronRight, TrendingUp, X, Edit, LogOut, Menu, PieChart, Activity, DollarSign, FileText, ArrowRightLeft, ArrowUp, ArrowDown, PiggyBank, Search, Archive, AlertTriangle, Briefcase, TrendingDown } from 'lucide-react';
+
+// --- Firebase Configuration ---
+const firebaseConfig = {
+  apiKey: "AIzaSyC1bRWjWTYY5FMXWqp8jZM2RLwtwgUNO4w",
+  authDomain: "jlw-cashflow-manager.firebaseapp.com",
+  projectId: "jlw-cashflow-manager",
+  storageBucket: "jlw-cashflow-manager.appspot.com",
+  messagingSenderId: "749973897964",
+  appId: "1:749973897964:web:89a8d0e60cfd2e2a681bc9",
+  measurementId: "G-5W5G95EDNL"
+};
+
+const getFirebaseConfig = () => {
+    if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+        try {
+            return JSON.parse(__firebase_config);
+        } catch (e) {
+            console.error("Error parsing provided Firebase config:", e);
+            return firebaseConfig;
+        }
+    }
+    return firebaseConfig;
+};
+
+// Initialize the main Firebase app
+if (!getApps().length) {
+    initializeApp(getFirebaseConfig());
+}
+const mainApp = getApps()[0];
+const auth = getAuth(mainApp);
+const db = getFirestore(mainApp);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-jlw-cashflow';
+
+// --- Helper Functions ---
+function getWeekNumber(d) {
+    d = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+    d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay() || 7));
+    var yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+    var weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+    return [d.getUTCFullYear(), weekNo];
+}
+
+const exportToCSV = (headers, data, filename) => {
+    const csvContent = [
+        headers.map(h => h.label).join(','),
+        ...data.map(row => 
+            headers.map(header => {
+                let value = row[header.accessor] ?? ''; 
+                if (typeof value === 'string' && value.includes(',')) {
+                    return `"${value}"`;
+                }
+                 if(typeof value === 'number') {
+                    return value.toLocaleString('en-US', {useGrouping: false});
+                }
+                return value;
+            }).join(',')
+        )
+    ].join('\n');
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement("a");
+    if (link.download !== undefined) {
+        const url = URL.createObjectURL(blob);
+        link.setAttribute("href", url);
+        link.setAttribute("download", `${filename}_${new Date().toISOString().split('T')[0]}.csv`);
+        link.style.visibility = 'hidden';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    }
+};
+
+const isPeriodLocked = (date, shopId, monthlyClosures) => {
+    if (!date || !shopId || !monthlyClosures) return false;
+    const d = date instanceof Date ? date : date.toDate();
+    const year = d.getFullYear();
+    const month = d.getMonth();
+    const periodId = `${year}-${month}-${shopId}`;
+    const allShopsPeriodId = `${year}-${month}-all`;
+    return monthlyClosures.some(c => c.id === periodId || c.id === allShopsPeriodId);
+};
+
+
+// --- Main App Component ---
+export default function App() {
+    const [view, setView] = useState('dashboard');
+    const [userId, setUserId] = useState(null);
+    const [loading, setLoading] = useState(true);
+    const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+
+    const [shops, setShops] = useState([]);
+    const [staff, setStaff] = useState([]);
+    const [shifts, setShifts] = useState([]);
+    const [positions, setPositions] = useState([]);
+    const [vendors, setVendors] = useState([]);
+    const [purchaseOrders, setPurchaseOrders] = useState([]);
+    const [expenseCategories, setExpenseCategories] = useState([]);
+    const [cashExpenses, setCashExpenses] = useState([]);
+    const [exchangeRate, setExchangeRate] = useState(4000);
+    const [reports, setReports] = useState([]);
+    const [internalTransfers, setInternalTransfers] = useState([]);
+    const [monthlyClosures, setMonthlyClosures] = useState([]);
+    const [adjustingEntries, setAdjustingEntries] = useState([]);
+    
+    useEffect(() => {
+        let viewportMeta = document.querySelector('meta[name="viewport"]');
+        if (!viewportMeta) {
+            viewportMeta = document.createElement('meta');
+            viewportMeta.name = "viewport";
+            document.head.appendChild(viewportMeta);
+        }
+        viewportMeta.content = "width=device-width, initial-scale=1.0";
+    }, []);
+    
+    useEffect(() => {
+        const unsubscribe = onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                setUserId(user.uid);
+            } else {
+                await signInAnonymously(auth);
+            }
+            setLoading(false);
+        });
+        return () => unsubscribe();
+    }, []);
+
+    useEffect(() => {
+        if (!userId) return;
+        
+        const collections = {
+            shops: setShops, staff: setStaff, shifts: setShifts,
+            positions: setPositions, vendors: setVendors, purchaseOrders: setPurchaseOrders,
+            expenseCategories: setExpenseCategories, cashExpenses: setCashExpenses,
+            internalTransfers: setInternalTransfers, monthlyClosures: setMonthlyClosures,
+            adjustingEntries: setAdjustingEntries
+        };
+        const unsubscribers = Object.entries(collections).map(([name, setter]) => 
+            onSnapshot(query(collection(db, `artifacts/${appId}/public/data/${name}`)), (snapshot) => {
+                const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                if (['reports', 'purchaseOrders', 'cashExpenses', 'vendors', 'internalTransfers', 'monthlyClosures', 'adjustingEntries', 'staff', 'positions'].includes(name)) {
+                    items.sort((a, b) => (b.createdAt?.toDate() || 0) - (a.createdAt?.toDate() || 0));
+                }
+                setter(items);
+            }, (error) => console.error(`Error fetching ${name}:`, error))
+        );
+        const unsubRate = onSnapshot(doc(db,`artifacts/${appId}/public/data/settings`,'exchangeRate'), (docSnap) => {
+            if (docSnap.exists()) setExchangeRate(docSnap.data().rate);
+            else setDoc(doc(db, `artifacts/${appId}/public/data/settings`, 'exchangeRate'), { rate: 4000 });
+        });
+        unsubscribers.push(unsubRate);
+        
+        return () => unsubscribers.forEach(unsub => unsub());
+    }, [userId]);
+    
+    const renderView = () => {
+        if (loading) return <div className="flex justify-center items-center h-full"><div className="loader"></div></div>;
+        switch (view) {
+            case 'dashboard': return <DashboardPage reports={reports} purchaseOrders={purchaseOrders} cashExpenses={cashExpenses} internalTransfers={internalTransfers} shops={shops} exchangeRate={exchangeRate} monthlyClosures={monthlyClosures} adjustingEntries={adjustingEntries} />;
+            case 'cashDrop': return <CashDropAndEntriesPage db={db} userId={userId} shops={shops} allStaff={staff} shifts={shifts} exchangeRate={exchangeRate} reports={reports} monthlyClosures={monthlyClosures} />;
+            case 'hr-management': return <HRManagementPage db={db} userId={userId} staff={staff} shops={shops} positions={positions}/>;
+            case 'summaryReports': return <SummaryReportsPage reports={reports} shops={shops} exchangeRate={exchangeRate} />;
+            case 'purchaseOrders': return <PurchaseOrdersPage db={db} userId={userId} vendors={vendors} purchaseOrders={purchaseOrders} shops={shops} exchangeRate={exchangeRate} monthlyClosures={monthlyClosures} />;
+            case 'internalTransfer': return <InternalTransferPage db={db} userId={userId} shops={shops} internalTransfers={internalTransfers} exchangeRate={exchangeRate} monthlyClosures={monthlyClosures} />;
+            case 'vendors': return <VendorsPage db={db} userId={userId} vendors={vendors} />;
+            case 'cashExpenses': return <CashExpensesPage db={db} userId={userId} expenseCategories={expenseCategories} cashExpenses={cashExpenses} shops={shops} exchangeRate={exchangeRate} monthlyClosures={monthlyClosures} />;
+            case 'monthlySaving': return <MonthlySavingPage reports={reports} cashExpenses={cashExpenses} shops={shops} exchangeRate={exchangeRate} />;
+            case 'periodEndClose': return <PeriodEndClosePage db={db} userId={userId} shops={shops} reports={reports} purchaseOrders={purchaseOrders} cashExpenses={cashExpenses} internalTransfers={internalTransfers} monthlyClosures={monthlyClosures} adjustingEntries={adjustingEntries} exchangeRate={exchangeRate} />;
+            case 'settings': return <Settings db={db} userId={userId} shops={shops} shifts={shifts} positions={positions} expenseCategories={expenseCategories} exchangeRate={exchangeRate} setExchangeRate={setExchangeRate} />;
+            default: return <DashboardPage reports={reports} purchaseOrders={purchaseOrders} cashExpenses={cashExpenses} internalTransfers={internalTransfers} shops={shops} exchangeRate={exchangeRate} monthlyClosures={monthlyClosures} adjustingEntries={adjustingEntries}/>;
+        }
+    };
+
+    return (
+        <div className="flex h-screen bg-slate-100 font-sans">
+            <Sidebar view={view} setView={setView} isSidebarOpen={isSidebarOpen} setIsSidebarOpen={setIsSidebarOpen} />
+            <div className="flex-1 flex flex-col overflow-hidden">
+                <header className="flex justify-between items-center p-4 bg-white border-b border-slate-200 lg:hidden">
+                    <button onClick={() => setIsSidebarOpen(true)} className="text-slate-500">
+                        <Menu size={24} />
+                    </button>
+                    <h1 className="text-lg font-bold text-slate-700">JLW Management</h1>
+                </header>
+                <main className="flex-1 overflow-x-hidden overflow-y-auto p-4 md:p-6 lg:p-8">
+                    {renderView()}
+                </main>
+            </div>
+        </div>
+    );
+}
+
+
+// --- Sidebar Navigation ---
+function Sidebar({ view, setView, isSidebarOpen, setIsSidebarOpen }) {
+    const navItems = [
+        { id: 'dashboard', label: 'Dashboard', icon: PieChart },
+        { id: 'cashDrop', label: 'CashDrop & Entries', icon: DollarSign },
+        { id: 'hr-management', label: 'HR Management', icon: Briefcase },
+        { id: 'purchaseOrders', label: 'Purchase Orders', icon: Truck },
+        { id: 'internalTransfer', label: 'Internal Transfer', icon: ArrowRightLeft },
+        { id: 'vendors', label: 'Vendors', icon: Users },
+        { id: 'cashExpenses', label: 'Cash Expenses', icon: Wallet },
+        { id: 'summaryReports', label: 'Sale Report', icon: BarChart2 },
+        { id: 'monthlySaving', label: 'Bank Deposite Saving', icon: PiggyBank },
+        { id: 'periodEndClose', label: 'Period-End Close', icon: Archive },
+    ];
+
+    const NavLink = ({ id, label, icon: Icon, onClick }) => (
+        <a
+            href="#"
+            onClick={(e) => { e.preventDefault(); onClick(); }}
+            className={`flex items-center px-4 py-3 text-sm font-medium rounded-lg transition-colors ${
+                view === id ? 'bg-slate-700 text-white' : 'text-slate-300 hover:bg-slate-700 hover:text-white'
+            }`}
+        >
+            <Icon size={20} className="mr-3" />
+            <span>{label}</span>
+        </a>
+    );
+
+    return (
+        <>
+            <div className={`fixed inset-0 bg-black bg-opacity-50 z-20 lg:hidden ${isSidebarOpen ? 'block' : 'hidden'}`} onClick={() => setIsSidebarOpen(false)}></div>
+            <aside className={`fixed lg:relative flex flex-col bg-slate-800 text-white w-64 h-screen p-4 z-30 transition-transform duration-300 ease-in-out ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'} lg:translate-x-0`}>
+                <div className="flex items-center mb-8 px-2">
+                    <Activity size={32} className="text-blue-400" />
+                    <h1 className="text-xl font-bold ml-3">JLW Cash Flow</h1>
+                </div>
+                <nav className="flex-1 space-y-2">
+                    {navItems.map(item => <NavLink key={item.id} {...item} onClick={() => { setView(item.id); setIsSidebarOpen(false); }} />)}
+                </nav>
+                <div>
+                     <NavLink id="settings" label="Settings" icon={SettingsIcon} onClick={() => { setView('settings'); setIsSidebarOpen(false); }} />
+                </div>
+            </aside>
+        </>
+    );
+}
+
+// --- Reusable Modal Component ---
+function Modal({ isOpen, onClose, title, children, size = 'lg' }) {
+    if (!isOpen) return null;
+    const sizeClasses = {
+        'sm': 'max-w-sm',
+        'md': 'max-w-md',
+        'lg': 'max-w-lg',
+        'xl': 'max-w-xl',
+        '2xl': 'max-w-2xl',
+    };
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-50 z-50 flex justify-center items-center p-4">
+            <div className={`bg-white rounded-lg shadow-xl w-full ${sizeClasses[size]}`}>
+                <div className="flex justify-between items-center p-4 border-b">
+                    <h3 className="text-xl font-bold">{title}</h3>
+                    <button onClick={onClose} className="p-1 rounded-full hover:bg-gray-200"><X size={20}/></button>
+                </div>
+                <div className="p-6 overflow-y-auto max-h-[80vh]">{children}</div>
+            </div>
+        </div>
+    );
+}
+
+// --- Combined CashDrop and Entries Page ---
+function CashDropAndEntriesPage({ db, userId, shops, allStaff, shifts, exchangeRate, reports, monthlyClosures }) {
+    return (
+        <div className="space-y-8">
+            <DailyReportForm 
+                db={db} userId={userId} shops={shops} 
+                allStaff={allStaff} shifts={shifts} exchangeRate={exchangeRate} 
+                monthlyClosures={monthlyClosures}
+            />
+            <ReportsDashboard 
+                reports={reports} db={db} allStaff={allStaff} 
+                shops={shops} shifts={shifts} exchangeRate={exchangeRate} 
+                userId={userId} monthlyClosures={monthlyClosures}
+            />
+        </div>
+    );
+}
+
+
+// --- Summary Reports Page ---
+function SummaryReportsPage({ reports, shops, exchangeRate }) {
+    const [reportType, setReportType] = useState('weekly');
+
+    return (
+        <div className="bg-white p-6 rounded-xl shadow-lg">
+            <div className="flex justify-between items-center mb-6 flex-wrap gap-4">
+                 <h2 className="text-2xl font-bold text-slate-800">Sale Reports</h2>
+                 <div className="w-full sm:w-48">
+                    <FormSelect
+                        label="Report Type"
+                        name="reportType"
+                        value={reportType}
+                        onChange={(e) => setReportType(e.target.value)}
+                        options={['weekly', 'monthly']}
+                        optionLabels={['Weekly Summary', 'Monthly Summary']}
+                    />
+                 </div>
+            </div>
+            {reportType === 'weekly' ? <WeeklyReport reports={reports} shops={shops} exchangeRate={exchangeRate} /> : <MonthlySummaryReport reports={reports} shops={shops} />}
+        </div>
+    );
+}
+
+
+// --- Dashboard Page ---
+function DashboardPage({ reports, purchaseOrders, cashExpenses, internalTransfers, shops, exchangeRate, monthlyClosures, adjustingEntries }) {
+    const [selectedShopId, setSelectedShopId] = useState('all');
+    const [selectedDate, setSelectedDate] = useState({ month: new Date().getMonth(), year: new Date().getFullYear() });
+    
+    const handleDateChange = (e) => {
+        setSelectedDate(prev => ({ ...prev, [e.target.name]: parseInt(e.target.value) }));
+    };
+
+    const openingBalance = useMemo(() => {
+        const { year, month } = selectedDate;
+        const prevMonthDate = new Date(year, month - 1);
+        const prevMonth = prevMonthDate.getMonth();
+        const prevYear = prevMonthDate.getFullYear();
+        
+        const closureId = `${prevYear}-${prevMonth}-${selectedShopId}`;
+        const closure = monthlyClosures.find(c => c.id === closureId);
+        
+        return closure ? closure.closingBalanceKhr : 0;
+    }, [selectedShopId, selectedDate, monthlyClosures]);
+    
+    const [openingGCA, setOpeningGCA] = useState(0);
+    useEffect(() => { setOpeningGCA(openingBalance); }, [openingBalance]);
+
+
+    const { metrics, trendData, expenseBreakdown, dailySales } = useMemo(() => {
+        const defaultMetrics = { netSale: 0, netProfit: 0, totalPR: 0, totalExpense: 0, netIncome: 0, goodsCashAdv: 0, monthlyGCAChange: 0, totalTransfersIn: 0, totalTransfersOut: 0 };
+        const isAllShops = selectedShopId === 'all';
+        const targetShops = isAllShops ? shops : shops.filter(s => s.id === selectedShopId);
+        
+        if (targetShops.length === 0 && !isAllShops) return { metrics: defaultMetrics, trendData: {}, expenseBreakdown: [], dailySales: [] };
+
+        const calculatePeriodMetrics = (month, year, shopList) => {
+            let totalNetSale = 0, totalNetProfit = 0, totalPR = 0, totalExpense = 0, totalTransfersIn = 0, totalTransfersOut = 0, totalAdjustments = 0;
+            
+            shopList.forEach(shop => {
+                const saleMargin = shop.saleMargin || 0;
+                
+                const filterByEntryDate = (items, shopId, dateField = 'createdAt') => items.filter(item => {
+                    const itemDate = item[dateField]?.toDate ? item[dateField].toDate() : new Date(item[dateField]);
+                    if (!itemDate || isNaN(itemDate)) return false;
+                    
+                    return item.shopId === shopId && itemDate.getMonth() === month && itemDate.getFullYear() === year;
+                });
+                const filterSalesByEntryDate = (items, shopName) => items.filter(item => {
+                    const itemDate = item.createdAt.toDate();
+                    return item.shop === shopName && itemDate.getMonth() === month && itemDate.getFullYear() === year;
+                });
+                
+                const filterTransfers = (items, shopId, direction) => items.filter(item => {
+                    const itemDate = new Date(item.transferDate + 'T00:00:00');
+                    const targetShopId = direction === 'out' ? item.fromShopId : item.toShopId;
+                    return targetShopId === shopId && itemDate.getMonth() === month && itemDate.getFullYear() === year;
+                });
+                
+                const filterAdjustments = (items, shopId) => items.filter(item => {
+                    const period = `${year}-${month}`;
+                    return item.shopId === shopId && item.period === period;
+                });
+                
+                const filteredReports = filterSalesByEntryDate(reports, shop.name);
+                const filteredPOs = filterByEntryDate(purchaseOrders, shop.id, 'poDate');
+                const filteredExpenses = filterByEntryDate(cashExpenses, shop.id, 'expenseDate');
+                const filteredTransfersIn = filterTransfers(internalTransfers, shop.id, 'in');
+                const filteredTransfersOut = filterTransfers(internalTransfers, shop.id, 'out');
+                const filteredAdjustments = filterAdjustments(adjustingEntries, shop.id);
+                
+                const shopNetSale = filteredReports.reduce((sum, r) => sum + r.grandTotalKhr, 0);
+                totalNetSale += shopNetSale;
+                totalNetProfit += shopNetSale * (saleMargin / 100);
+                totalPR += filteredPOs.reduce((sum, po) => sum + (po.amountUsd * exchangeRate) + po.amountKhr, 0);
+                totalExpense += filteredExpenses.reduce((sum, exp) => sum + (exp.amountUsd * exchangeRate) + exp.amountKhr, 0);
+                totalTransfersIn += filteredTransfersIn.reduce((sum, t) => sum + (t.amountUsd * exchangeRate) + t.amountKhr, 0);
+                totalTransfersOut += filteredTransfersOut.reduce((sum, t) => sum + (t.amountUsd * exchangeRate) + t.amountKhr, 0);
+                totalAdjustments += filteredAdjustments.reduce((sum, a) => sum + a.amountKhr, 0);
+            });
+            
+            const netIncome = totalNetProfit - totalExpense;
+            return { netSale: totalNetSale, netProfit: totalNetProfit, totalPR, totalExpense, totalTransfersIn, totalTransfersOut, netIncome, totalAdjustments };
+        };
+
+        const currentMetrics = calculatePeriodMetrics(selectedDate.month, selectedDate.year, targetShops);
+        
+        const prevDate = new Date(selectedDate.year, selectedDate.month - 1, 1);
+        const prevMetrics = calculatePeriodMetrics(prevDate.getMonth(), prevDate.getFullYear(), targetShops);
+
+        const calculateTrend = (current, previous) => {
+            if (previous === 0) return current > 0 ? 100 : 0;
+            if (current === 0 && previous < 0) return 100;
+            return ((current - previous) / Math.abs(previous)) * 100;
+        };
+        
+        const monthlyGCAChange = currentMetrics.netSale - currentMetrics.totalPR - currentMetrics.totalExpense - currentMetrics.totalTransfersOut + currentMetrics.totalTransfersIn + currentMetrics.totalAdjustments;
+        const closingGCA = openingGCA + monthlyGCAChange;
+
+        const daysInMonth = new Date(selectedDate.year, selectedDate.month + 1, 0).getDate();
+        const salesData = Array.from({length: daysInMonth}, (_, i) => ({day: i+1, total: 0}));
+        reports.forEach(r => {
+            const d = r.createdAt.toDate();
+            if((isAllShops || shops.find(s=>s.name===r.shop)?.id === selectedShopId) && d.getFullYear() === selectedDate.year && d.getMonth() === selectedDate.month) {
+                salesData[d.getDate()-1].total += r.grandTotalKhr;
+            }
+        });
+        
+        return { 
+            metrics: { 
+                ...currentMetrics, 
+                goodsCashAdv: closingGCA,
+                monthlyGCAChange: monthlyGCAChange,
+            },
+            trendData: {
+                netSale: calculateTrend(currentMetrics.netSale, prevMetrics.netSale),
+                netProfit: calculateTrend(currentMetrics.netProfit, prevMetrics.netProfit),
+                netIncome: calculateTrend(currentMetrics.netIncome, prevMetrics.netIncome),
+            },
+            expenseBreakdown: [
+                { name: 'Purchase Orders', value: currentMetrics.totalPR, color: '#3b82f6' },
+                { name: 'Cash Expenses', value: currentMetrics.totalExpense, color: '#f97316' },
+                { name: 'Transfers Out', value: currentMetrics.totalTransfersOut, color: '#8b5cf6' },
+            ],
+            dailySales: salesData,
+        };
+
+    }, [selectedShopId, selectedDate, openingGCA, reports, purchaseOrders, cashExpenses, internalTransfers, shops, exchangeRate, adjustingEntries]);
+
+    const years = [...new Set(reports.map(r => r.createdAt.toDate().getFullYear()))].sort((a, b) => b - a);
+    if (!years.includes(new Date().getFullYear())) years.unshift(new Date().getFullYear());
+    const months = Array.from({length: 12}, (e, i) => new Date(null, i, 1).toLocaleDateString("en", {month: "long"}));
+    
+    return (
+        <div className="space-y-6">
+            <div className="flex justify-between items-center flex-wrap gap-4 mb-6">
+                <h1 className="text-3xl font-bold text-slate-800">Dashboard</h1>
+                <div className="flex flex-wrap items-end gap-2">
+                     <div className="flex-grow min-w-[150px]">
+                        <FormInput label="Opening GCA Balance (៛)" type="number" name="openingGCA" value={openingGCA} onChange={e => setOpeningGCA(parseFloat(e.target.value) || 0)} disabled={openingBalance !== 0} />
+                         {openingBalance !== 0 && <span className="text-xs text-slate-500">From previous month's close.</span>}
+                    </div>
+                    <div className="flex-grow min-w-[150px]"><FormSelect label="Shop" name="selectedShopId" value={selectedShopId} onChange={e => setSelectedShopId(e.target.value)} options={['all', ...shops.map(s => s.id)]} optionLabels={['All Shops', ...shops.map(s => s.name)]} /></div>
+                    <div className="flex-grow min-w-[150px]"><FormSelect label="Month" name="month" value={selectedDate.month} onChange={handleDateChange} options={months.map((m, i) => i)} optionLabels={months} /></div>
+                    <div className="flex-grow min-w-[100px]"><FormSelect label="Year" name="year" value={selectedDate.year} onChange={handleDateChange} options={years} /></div>
+                </div>
+            </div>
+
+            <div className="space-y-6">
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                    <MetricCard title="Net Sale" value={metrics.netSale} currency="៛" trend={trendData.netSale} icon={<TrendingUp size={28} />} color="blue" />
+                    <MetricCard title="Net Profit" value={metrics.netProfit} currency="៛" trend={trendData.netProfit} icon={<DollarSign size={28} />} color="green" />
+                    <MetricCard title="Net Income" value={metrics.netIncome} currency="៛" trend={trendData.netIncome} icon={<PiggyBank size={28} />} color="amber" />
+                </div>
+                <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
+                    <div className="lg:col-span-3 bg-white p-6 rounded-xl shadow-lg">
+                        <h3 className="font-bold text-lg mb-4 text-slate-700">Daily Sales for {months[selectedDate.month]} {selectedDate.year}</h3>
+                        <BarChart data={dailySales} />
+                    </div>
+                    <div className="lg:col-span-2 bg-white p-6 rounded-xl shadow-lg">
+                        <h3 className="font-bold text-lg mb-4 text-slate-700">Value Outflow Breakdown</h3>
+                        <div className="flex items-center justify-center h-full">
+                            <SimplePieChart data={expenseBreakdown}/>
+                        </div>
+                    </div>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                    <InfoCard title="Total Purchase Order" value={metrics.totalPR} currency="៛" icon={<Truck size={24}/>} color="indigo"/>
+                    <InfoCard title="Total Expense" value={metrics.totalExpense} currency="៛" icon={<Wallet size={24}/>} color="orange"/>
+                    <InfoCard title="Goods Cash Advance (Closing)" value={metrics.goodsCashAdv} currency="៛" isPositive={metrics.goodsCashAdv >= 0} tooltip="Opening Balance + This Month's Change" monthlyChange={metrics.monthlyGCAChange} icon={<FileText size={24}/>} color="cyan"/>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <InfoCard title="Total Transfers In" value={metrics.totalTransfersIn} currency="៛" isPositive={true} icon={<ArrowUp size={24}/>} color="emerald"/>
+                    <InfoCard title="Total Transfers Out" value={metrics.totalTransfersOut} currency="៛" isPositive={false} icon={<ArrowDown size={24}/>} color="red"/>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function MetricCard({ title, value, currency, trend, icon, color }) {
+    const isPositive = trend >= 0;
+    const trendColor = isPositive ? 'text-green-600' : 'text-red-500';
+    const colorClasses = {
+        blue: 'from-blue-500 to-blue-400 text-white',
+        green: 'from-green-500 to-green-400 text-white',
+        amber: 'from-amber-500 to-amber-400 text-white',
+    };
+
+    return (
+        <div className={`bg-gradient-to-br ${colorClasses[color]} p-6 rounded-xl shadow-lg hover:shadow-xl transition-shadow flex flex-col justify-between`}>
+            <div className="flex justify-between items-start">
+                <h3 className="text-lg font-semibold text-white/90">{title}</h3>
+                 <div className="bg-white/20 p-2 rounded-lg">{icon}</div>
+            </div>
+            <div>
+                 <p className="text-4xl font-bold mt-4">{value.toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0})} <span className="text-2xl font-medium opacity-80">{currency}</span></p>
+                {trend !== undefined && isFinite(trend) &&
+                    <div className={`flex items-center text-sm font-semibold bg-white/20 px-2 py-1 rounded-full mt-2 w-fit ${isPositive ? 'text-green-50' : 'text-red-50'}`}>
+                        {isPositive ? <TrendingUp size={16} className="mr-1"/> : <TrendingDown size={16} className="mr-1"/>}
+                        {Math.abs(trend).toFixed(1)}% vs last month
+                    </div>
+                }
+            </div>
+        </div>
+    );
+}
+
+function InfoCard({ title, value, currency, isPositive, tooltip, monthlyChange, icon, color }) {
+    const colorClasses = {
+        indigo: 'text-indigo-600 bg-indigo-100',
+        orange: 'text-orange-600 bg-orange-100',
+        cyan: 'text-cyan-600 bg-cyan-100',
+        emerald: 'text-emerald-600 bg-emerald-100',
+        red: 'text-red-600 bg-red-100',
+    };
+
+    return (
+        <div className="bg-white p-6 rounded-xl shadow-lg flex items-start gap-4">
+            <div className={`p-3 rounded-lg ${colorClasses[color]}`}>{icon}</div>
+            <div>
+                 <h3 className="text-sm font-semibold text-slate-500">{title} {tooltip && <span className="text-xs italic" title={tooltip}>*</span>}</h3>
+                 <p className="text-2xl font-bold text-slate-800 mt-1">{value.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})} <span className="text-lg font-medium text-slate-500">{currency}</span></p>
+                {monthlyChange !== undefined && (
+                    <p className="text-sm text-slate-500 mt-1">
+                        This Month: <span className={monthlyChange >= 0 ? 'text-green-500' : 'text-red-500'}>{monthlyChange.toLocaleString('en-US', {signDisplay: 'always', minimumFractionDigits: 2})}</span>
+                    </p>
+                )}
+            </div>
+        </div>
+    );
+}
+
+function BarChart({ data }) {
+    const maxVal = Math.max(...data.map(d => d.total));
+    return (
+        <div className="h-64 flex items-end justify-around gap-2">
+            {data.map((d, i) => (
+                <div key={i} className="flex-1 flex flex-col items-center gap-2">
+                    <div className="w-full bg-slate-100 rounded-t-lg hover:bg-blue-200 transition-colors group flex items-end" style={{ height: '100%' }}>
+                        <div 
+                            className="w-full bg-blue-500 group-hover:bg-blue-600 rounded-t-lg"
+                            style={{ height: `${maxVal > 0 ? (d.total / maxVal) * 100 : 0}%` }}
+                        ></div>
+                    </div>
+                    <span className="text-xs text-slate-500">{d.day}</span>
+                </div>
+            ))}
+        </div>
+    );
+}
+
+function Sparkline({ data, isPositive }) {
+    if (!data || data.length === 0) return null;
+    const max = Math.max(...data);
+    const min = Math.min(...data);
+    const range = max - min;
+    const points = data.map((d, i) => {
+        const x = (i / (data.length - 1)) * 100;
+        const y = 100 - (range > 0 ? ((d - min) / range) * 100 : 50);
+        return `${x},${y}`;
+    }).join(' ');
+    const color = isPositive ? '#10b981' : '#ef4444';
+
+    return (
+        <svg viewBox="0 0 100 100" className="w-full h-full" preserveAspectRatio="none">
+            <polyline fill="none" stroke={color} strokeWidth="3" points={points} />
+        </svg>
+    );
+}
+
+function SimplePieChart({ data }) {
+    const total = data.reduce((sum, item) => sum + item.value, 0);
+    if (total === 0) return <p className="text-slate-500">No outflow data for this period.</p>;
+    
+    let cumulative = 0;
+    const paths = data.map(item => {
+        if(item.value === 0) return null;
+        const percentage = item.value / total;
+        const startAngle = (cumulative / total) * 360;
+        const endAngle = startAngle + percentage * 360;
+        cumulative += item.value;
+
+        const largeArcFlag = percentage > 0.5 ? 1 : 0;
+        const x1 = 50 + 40 * Math.cos(Math.PI * startAngle / 180);
+        const y1 = 50 + 40 * Math.sin(Math.PI * startAngle / 180);
+        const x2 = 50 + 40 * Math.cos(Math.PI * endAngle / 180);
+        const y2 = 50 + 40 * Math.sin(Math.PI * endAngle / 180);
+        
+        return <path key={item.name} d={`M50,50 L${x1},${y1} A40,40 0 ${largeArcFlag},1 ${x2},${y2} Z`} fill={item.color} />;
+    });
+
+    return (
+        <div className="flex items-center gap-6">
+            <svg viewBox="0 0 100 100" width="120" height="120">{paths}</svg>
+            <div className="space-y-2">
+                {data.map(item => item.value > 0 && (
+                    <div key={item.name} className="flex items-center text-sm">
+                        <span className="w-3 h-3 rounded-full mr-2" style={{backgroundColor: item.color}}></span>
+                        <span className="text-slate-600">{item.name}</span>
+                        <span className="ml-auto font-semibold text-slate-800">{(item.value/total*100).toFixed(1)}%</span>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+}
+
+
+// --- Daily Report Form Component ---
+function DailyReportForm({ db, userId, shops, allStaff, shifts, exchangeRate, monthlyClosures }) {
+    const [formData, setFormData] = useState({ shop: '', staff: '', shift: '', bankUsd: '', bankKhr: '', cashUsd: '', cashKhr: '' });
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    const [message, setMessage] = useState({ type: '', text: '' });
+    useEffect(() => { if (shops.length > 0 && !formData.shop) setFormData(f => ({ ...f, shop: shops[0].name })); if (shifts.length > 0 && !formData.shift) setFormData(f => ({ ...f, shift: shifts[0].name })); }, [shops, shifts]);
+    const availableStaff = useMemo(() => {
+        if (!formData.shop || !shops.length || !allStaff.length) return [];
+        const shop = shops.find(s => s.name === formData.shop);
+        if (!shop) return [];
+        return allStaff.filter(s => s.shopIds && s.shopIds.includes(shop.id)).map(s => s.name);
+    }, [formData.shop, shops, allStaff]);
+    useEffect(() => { if (availableStaff.length > 0 && !availableStaff.includes(formData.staff)) setFormData(f => ({ ...f, staff: availableStaff[0] })); else if (availableStaff.length === 0) setFormData(f => ({ ...f, staff: '' })); }, [availableStaff, formData.shop]);
+    const handleChange = (e) => { const { name, value } = e.target; setFormData(prev => ({...prev, [name]: value })); };
+    const grandTotalKhr = useMemo(() => ((parseFloat(formData.bankUsd)||0) + (parseFloat(formData.cashUsd)||0)) * exchangeRate + ((parseFloat(formData.bankKhr)||0) + (parseFloat(formData.cashKhr)||0)), [formData, exchangeRate]);
+    
+    const handleSubmit = async (e) => {
+        e.preventDefault(); 
+        const selectedShop = shops.find(s => s.name === formData.shop);
+        if (isPeriodLocked(new Date(), selectedShop?.id, monthlyClosures)) {
+            setMessage({ type: 'error', text: 'This period is closed and cannot be modified.' });
+            return;
+        }
+        if (!formData.shop || !formData.staff || !formData.shift) { setMessage({ type: 'error', text: 'Please select Shop, Staff, and Shift.' }); return; }
+        setIsSubmitting(true); setMessage({ type: '', text: '' });
+        const dataToSave = { shop: formData.shop, shopId: selectedShop?.id, staff: formData.staff, shift: formData.shift, bankUsd: parseFloat(formData.bankUsd)||0, bankKhr: parseFloat(formData.bankKhr)||0, cashUsd: parseFloat(formData.cashUsd)||0, cashKhr: parseFloat(formData.cashKhr)||0, grandTotalKhr, exchangeRate, createdAt: new Date(), userId, };
+        try { await addDoc(collection(db, `artifacts/${appId}/public/data/reports`), dataToSave); setMessage({ type: 'success', text: 'Report submitted!' }); setFormData(f => ({ ...f, bankUsd: '', bankKhr: '', cashUsd: '', cashKhr: '' })); setTimeout(() => setMessage({ type: '', text: '' }), 3000); } catch (error) { console.error(error); setMessage({ type: 'error', text: 'Submission failed.' }); } finally { setIsSubmitting(false); }
+    };
+    return (<div className="bg-white p-6 rounded-xl shadow-lg"><h2 className="text-2xl font-bold mb-4 text-slate-800">New CashDrop Report</h2><form onSubmit={handleSubmit} className="grid grid-cols-1 md:grid-cols-2 gap-6"><div className="space-y-4"><div className="grid grid-cols-1 sm:grid-cols-3 gap-4"><FormSelect label="Shop" name="shop" value={formData.shop} onChange={handleChange} options={shops.map(s => s.name)} /><FormSelect label="Staff" name="staff" value={formData.staff} onChange={handleChange} options={availableStaff} /><FormSelect label="Shift" name="shift" value={formData.shift} onChange={handleChange} options={shifts.map(s => s.name)} /></div><div className="p-4 border rounded-lg"><h3 className="font-semibold mb-2">Net Sales by Bank</h3><div className="flex space-x-4"><FormInput label="USD ($)" type="number" name="bankUsd" value={formData.bankUsd} onChange={handleChange} /><FormInput label="KHR (៛)" type="number" name="bankKhr" value={formData.bankKhr} onChange={handleChange} /></div></div><div className="p-4 border rounded-lg"><h3 className="font-semibold mb-2">Net Sales by Cash</h3><div className="flex space-x-4"><FormInput label="USD ($)" type="number" name="cashUsd" value={formData.cashUsd} onChange={handleChange} /><FormInput label="KHR (៛)" type="number" name="cashKhr" value={formData.cashKhr} onChange={handleChange} /></div></div></div><div className="bg-slate-50 p-6 rounded-lg flex flex-col justify-between"><div><h3 className="text-xl font-bold mb-4">Summary</h3><div className="space-y-3"><SummaryRow label="Current Exchange Rate" value={`${exchangeRate.toLocaleString()} ៛`} /><SummaryRow label="Total Bank Sales" value={`${((parseFloat(formData.bankUsd)||0)*exchangeRate + (parseFloat(formData.bankKhr)||0)).toLocaleString()} ៛`} /><SummaryRow label="Total Cash Sales" value={`${((parseFloat(formData.cashUsd)||0)*exchangeRate + (parseFloat(formData.cashKhr)||0)).toLocaleString()} ៛`} /></div><div className="mt-6 pt-4 border-t"><p className="text-lg font-semibold">Grand Total (in KHR)</p><p className="text-4xl font-bold text-blue-600">{grandTotalKhr.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})} ៛</p></div></div><div className="mt-6"><button type="submit" disabled={isSubmitting} className="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 transition-colors disabled:bg-gray-400">{isSubmitting?'Submitting...':'Submit Report'}</button>{message.text&&<p className={`mt-4 text-center text-sm ${message.type==='success'?'text-green-600':'text-red-600'}`}>{message.text}</p>}</div></div></form></div>);
+}
+
+// --- All Entries Dashboard ---
+function ReportsDashboard({ reports, db, allStaff, shops, shifts, exchangeRate, userId, monthlyClosures }) {
+    const [filters, setFilters] = useState({ shop: '', shift: '', startDate: '', endDate: '' });
+    const [editingReport, setEditingReport] = useState(null);
+    const handleFilterChange = (e) => setFilters(prev => ({ ...prev, [e.target.name]: e.target.value }));
+    const filteredReports = useMemo(() => reports.filter(r => {
+        const d = r.createdAt.toDate(); const s = filters.startDate ? new Date(filters.startDate) : null; const e = filters.endDate ? new Date(filters.endDate) : null;
+        if(s) s.setHours(0,0,0,0); if(e) e.setHours(23,59,59,999);
+        return (!filters.shop || r.shop === filters.shop) && (!filters.shift || r.shift === filters.shift) && (!s || d >= s) && (!e || d <= e);
+    }), [reports, filters]);
+
+    const totals = useMemo(() => {
+        return filteredReports.reduce((acc, r) => {
+            acc.cashUsd += r.cashUsd || 0;
+            acc.cashKhr += r.cashKhr || 0;
+            acc.bankUsd += r.bankUsd || 0;
+            acc.bankKhr += r.bankKhr || 0;
+            acc.grandTotalKhr += r.grandTotalKhr || 0;
+            return acc;
+        }, { cashUsd: 0, cashKhr: 0, bankUsd: 0, bankKhr: 0, grandTotalKhr: 0 });
+    }, [filteredReports]);
+
+    const handleDelete = async (report) => {
+        if (isPeriodLocked(report.createdAt, report.shopId, monthlyClosures)) {
+            alert("Cannot delete entry from a closed period.");
+            return;
+        }
+        if(window.confirm("Are you sure?")) {
+            try { await deleteDoc(doc(db, `artifacts/${appId}/public/data/reports`, report.id)); } catch (e) { console.error("Error deleting report: ", e); alert("Failed to delete entry."); }
+        }
+    };
+    const handleUpdate = async (updatedReport) => {
+        const { id, ...data } = updatedReport;
+        try { await updateDoc(doc(db, `artifacts/${appId}/public/data/reports`, id), data); setEditingReport(null); } catch(e) { console.error("Error updating report: ", e); alert("Failed to update entry."); }
+    };
+    const uniqueShops = [...new Set(reports.map(r => r.shop))];
+    const uniqueShifts = [...new Set(reports.map(r => r.shift))];
+    return (<><div className="bg-white p-6 rounded-xl shadow-lg mt-6"><div className="flex justify-between items-center mb-4"><h2 className="text-2xl font-bold text-slate-800">All Net-Sale Entries</h2><button onClick={() => exportToCSV([{label: 'Date & Time', accessor: 'createdAt'},{label: 'Shop', accessor: 'shop'},{label:'Staff', accessor:'staff'}, {label: 'Cash ($)', accessor: 'cashUsd'},{label: 'Cash (៛)', accessor: 'cashKhr'},{label: 'Bank ($)', accessor: 'bankUsd'},{label: 'Bank (៛)', accessor: 'bankKhr'},{label: 'Net-Sale (៛)', accessor: 'grandTotalKhr'}], filteredReports.map(r => ({...r, createdAt: r.createdAt.toDate().toLocaleString()})), 'netsale_entries')} className="flex items-center gap-2 bg-green-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-green-700"><Download size={18}/> Export</button></div><div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-4 p-4 bg-slate-50 rounded-lg"><FormSelect label="By Shop" name="shop" value={filters.shop} onChange={handleFilterChange} options={['', ...uniqueShops]}/><FormSelect label="By Shift" name="shift" value={filters.shift} onChange={handleFilterChange} options={['', ...uniqueShifts]}/><FormInput label="Start Date" type="date" name="startDate" value={filters.startDate} onChange={handleFilterChange} /><FormInput label="End Date" type="date" name="endDate" value={filters.endDate} onChange={handleFilterChange} /></div><div className="overflow-x-auto"><table className="w-full text-left"><thead className="bg-slate-100"><tr><th className="p-3">Date & Time</th><th className="p-3">Shop</th><th className="p-3">Staff</th><th className="p-3 text-right">Cash ($)</th><th className="p-3 text-right">Cash (៛)</th><th className="p-3 text-right">Bank ($)</th><th className="p-3 text-right">Bank (៛)</th><th className="p-3 text-right">Net-Sale (៛)</th><th className="p-3">Actions</th></tr></thead><tbody>{filteredReports.map(r => {
+        const isLocked = isPeriodLocked(r.createdAt, r.shopId, monthlyClosures);
+        return (<tr key={r.id} className={`border-b hover:bg-slate-50 ${isLocked ? 'bg-slate-100 text-gray-500' : ''}`}><td className="p-3">{r.createdAt.toDate().toLocaleString()}</td><td className="p-3">{r.shop}</td><td className="p-3">{r.staff}</td><td className="p-3 text-right font-mono">{(r.cashUsd || 0).toLocaleString()}</td><td className="p-3 text-right font-mono">{(r.cashKhr || 0).toLocaleString()}</td><td className="p-3 text-right font-mono">{(r.bankUsd || 0).toLocaleString()}</td><td className="p-3 text-right font-mono">{(r.bankKhr || 0).toLocaleString()}</td><td className="p-3 text-right font-semibold">{r.grandTotalKhr.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}</td><td className="p-3"><div className="flex gap-2">{!isLocked ? (<><button onClick={()=>setEditingReport(r)} className="p-1 text-blue-600 hover:text-blue-800"><Edit size={16}/></button><button onClick={()=>handleDelete(r)} className="p-1 text-red-600 hover:text-red-800"><Trash2 size={16}/></button></>) : (<span className="text-xs italic">Locked</span>)}</div></td></tr>)})}</tbody><tfoot className="bg-slate-200 font-bold"><tr><td colSpan="3" className="p-3 text-right">Grand Total</td><td className="p-3 text-right font-mono">{totals.cashUsd.toLocaleString()}</td><td className="p-3 text-right font-mono">{totals.cashKhr.toLocaleString()}</td><td className="p-3 text-right font-mono">{totals.bankUsd.toLocaleString()}</td><td className="p-3 text-right font-mono">{totals.bankKhr.toLocaleString()}</td><td className="p-3 text-right">{totals.grandTotalKhr.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})} ៛</td><td></td></tr></tfoot></table>{filteredReports.length === 0 && <p className="text-center py-8 text-gray-500">No entries match filters.</p>}</div></div>
+    <Modal isOpen={!!editingReport} onClose={()=>setEditingReport(null)} title="Edit Daily Entry">
+       {editingReport && <EditDailyReportForm report={editingReport} onSave={handleUpdate} onClose={()=>setEditingReport(null)} allStaff={allStaff} shops={shops} shifts={shifts} exchangeRate={exchangeRate} />}
+    </Modal>
+    </>);
+}
+
+function EditDailyReportForm({ report, onSave, onClose, allStaff, shops, shifts, exchangeRate }) {
+    const [formData, setFormData] = useState(report);
+    const handleChange = (e) => { const { name, value } = e.target; setFormData(prev => ({...prev, [name]: value })); };
+    const grandTotalKhr = useMemo(() => ((parseFloat(formData.bankUsd)||0) + (parseFloat(formData.cashUsd)||0)) * exchangeRate + ((parseFloat(formData.bankKhr)||0) + (parseFloat(formData.cashKhr)||0)), [formData, exchangeRate]);
+    const availableStaff = useMemo(() => { if (!formData.shop || !shops.length || !allStaff.length) return []; const shop = shops.find(s => s.name === formData.shop); if (!shop) return []; return allStaff.filter(s => s.shopIds && s.shopIds.includes(shop.id)).map(s => s.name); }, [formData.shop, shops, allStaff]);
+    const handleSave = () => { const dataToSave = { ...formData, bankUsd: parseFloat(formData.bankUsd)||0, bankKhr: parseFloat(formData.bankKhr)||0, cashUsd: parseFloat(formData.cashUsd)||0, cashKhr: parseFloat(formData.cashKhr)||0, grandTotalKhr, }; onSave(dataToSave); };
+    return (<div className="space-y-4"><p className="text-xs text-gray-500">Original entry on: {report.createdAt.toDate().toLocaleString()}</p><div className="grid grid-cols-1 sm:grid-cols-3 gap-4"><FormSelect label="Shop" name="shop" value={formData.shop} onChange={handleChange} options={shops.map(s => s.name)} /><FormSelect label="Staff" name="staff" value={formData.staff} onChange={handleChange} options={availableStaff} /><FormSelect label="Shift" name="shift" value={formData.shift} onChange={handleChange} options={shifts.map(s => s.name)} /></div><div className="p-4 border rounded-lg"><h3 className="font-semibold mb-2">Bank</h3><div className="flex gap-4"><FormInput label="USD ($)" type="number" name="bankUsd" value={formData.bankUsd} onChange={handleChange} /><FormInput label="KHR (៛)" type="number" name="bankKhr" value={formData.bankKhr} onChange={handleChange} /></div></div><div className="p-4 border rounded-lg"><h3 className="font-semibold mb-2">Cash</h3><div className="flex gap-4"><FormInput label="USD ($)" type="number" name="cashUsd" value={formData.cashUsd} onChange={handleChange} /><FormInput label="KHR (៛)" type="number" name="cashKhr" value={formData.cashKhr} onChange={handleChange} /></div></div><div className="flex justify-end gap-4"><button onClick={onClose} className="px-4 py-2 rounded-md bg-gray-200 hover:bg-gray-300">Cancel</button><button onClick={handleSave} className="px-4 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-700">Save</button></div></div>);
+}
+
+// --- Weekly Report Component ---
+function WeeklyReport({ reports, shops, exchangeRate }) {
+    const [currentDate, setCurrentDate] = useState(new Date());
+    const { weeklyData, totals, weekLabel } = useMemo(() => {
+        const d = new Date(currentDate); const day = d.getDay(); const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+        const startOfWeek = new Date(d.setDate(diff)); startOfWeek.setHours(0, 0, 0, 0);
+        const endOfWeek = new Date(startOfWeek); endOfWeek.setDate(startOfWeek.getDate() + 6); endOfWeek.setHours(23, 59, 59, 999);
+        const [year, weekNo] = getWeekNumber(currentDate);
+
+        const filteredReports = reports.filter(r => { const d = r.createdAt.toDate(); return d >= startOfWeek && d <= endOfWeek; });
+        const data = new Map();
+        shops.forEach(shop => { data.set(shop.name, { shopName: shop.name, cashKhr: 0, cashUsd: 0, bankKhr: 0, bankUsd: 0, subtotal: 0 }); });
+        filteredReports.forEach(r => { 
+            if (data.has(r.shop)) { 
+                const d=data.get(r.shop); 
+                d.cashKhr+=r.cashKhr||0; 
+                d.cashUsd+=r.cashUsd||0; 
+                d.bankKhr+=r.bankKhr||0; 
+                d.bankUsd+=r.bankUsd||0;
+                d.subtotal += r.grandTotalKhr || 0;
+            } 
+        });
+        const totals = { cashKhr: 0, cashUsd: 0, bankKhr: 0, bankUsd: 0, subtotal: 0 };
+        Array.from(data.values()).forEach(d => { 
+            totals.cashKhr+=d.cashKhr; 
+            totals.cashUsd+=d.cashUsd; 
+            totals.bankKhr+=d.bankKhr; 
+            totals.bankUsd+=d.bankUsd;
+            totals.subtotal+=d.subtotal;
+        });
+        return { weeklyData: Array.from(data.values()), totals, weekLabel: `Week ${weekNo}, ${year}` };
+    }, [reports, shops, currentDate, exchangeRate]);
+
+    const changeWeek = (amount) => { setCurrentDate(prev => { const d = new Date(prev); d.setDate(d.getDate() + amount*7); return d; }); };
+
+    return (<div><div className="flex justify-between items-center mb-4 flex-wrap gap-4"><h2 className="text-xl font-bold">Weekly Sales Summary</h2><div className="flex items-center gap-2"><button onClick={()=>changeWeek(-1)} className="p-2 rounded-md hover:bg-gray-200"><ChevronLeft/></button><span className="font-semibold text-lg">{weekLabel}</span><button onClick={()=>changeWeek(1)} className="p-2 rounded-md hover:bg-gray-200"><ChevronRight/></button></div><button onClick={() => exportToCSV([{label: 'No.', accessor: 'index'},{label: 'Shop Name', accessor: 'shopName'},{label: 'Cash KHR (៛)', accessor: 'cashKhr'},{label: 'Cash USD ($)', accessor: 'cashUsd'},{label: 'Bank KHR (៛)', accessor: 'bankKhr'},{label: 'Bank USD ($)', accessor: 'bankUsd'},{label: 'Subtotal (៛)', accessor: 'subtotal'}], weeklyData.map((d,i)=>({...d, index: i+1})), `weekly_summary_${weekLabel.replace(', ','_')}`)} className="flex items-center gap-2 bg-green-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-green-700"><Download size={18}/> Export</button></div><div className="overflow-x-auto"><table className="w-full text-left"><thead className="bg-slate-100"><tr><th className="p-3">No.</th><th className="p-3">Shop Name</th><th className="p-3 text-right">Cash (៛)</th><th className="p-3 text-right">Cash ($)</th><th className="p-3 text-right">Bank (៛)</th><th className="p-3 text-right">Bank ($)</th><th className="p-3 text-right">Subtotal (៛)</th></tr></thead><tbody>{weeklyData.map((data, index)=>(<tr key={data.shopName} className="border-b"><td className="p-3">{index+1}</td><td className="p-3 font-semibold">{data.shopName}</td><td className="p-3 text-right font-mono">{data.cashKhr.toLocaleString()}</td><td className="p-3 text-right font-mono">{data.cashUsd.toLocaleString()}</td><td className="p-3 text-right font-mono">{data.bankKhr.toLocaleString()}</td><td className="p-3 text-right font-mono">{data.bankUsd.toLocaleString()}</td><td className="p-3 text-right font-bold">{data.subtotal.toLocaleString('en-US',{minimumFractionDigits:2})}</td></tr>))}</tbody><tfoot className="bg-gray-200 font-bold"><tr><td colSpan="2" className="p-3 text-right">Grand Total</td><td className="p-3 text-right font-mono">{totals.cashKhr.toLocaleString()}</td><td className="p-3 text-right font-mono">{totals.cashUsd.toLocaleString()}</td><td className="p-3 text-right font-mono">{totals.bankKhr.toLocaleString()}</td><td className="p-3 text-right font-mono">{totals.bankUsd.toLocaleString()}</td><td className="p-3 text-right">{totals.subtotal.toLocaleString('en-US',{minimumFractionDigits:2})}</td></tr></tfoot></table>{shops.length>0&&weeklyData.every(d=>!d.cashKhr&&!d.cashUsd&&!d.bankKhr&&!d.bankUsd)&&<p className="text-center py-8 text-gray-500">No sales data.</p>}{shops.length===0&&<p className="text-center py-8 text-gray-500">Add shops in Settings.</p>}</div></div>);
+}
+
+// --- Monthly Summary Report Component ---
+function MonthlySummaryReport({ reports, shops }) {
+    const [startDate, setStartDate] = useState(() => { const d = new Date(); d.setMonth(d.getMonth() - 11); return d; });
+    const handleYearChange = (e) => { const nY = parseInt(e.target.value); const nD = new Date(startDate); nD.setFullYear(nY); setStartDate(nD); };
+    const handleMonthChange = (e) => { const nM = parseInt(e.target.value); const nD = new Date(startDate); nD.setMonth(nM); setStartDate(nD); };
+    const { monthHeaders, summaryData, monthlyTotals } = useMemo(() => {
+        const mH = []; const sD = new Map(); const mT = Array(12).fill(0);
+        shops.forEach(shop => sD.set(shop.name, Array(12).fill(0)));
+        for (let i = 0; i < 12; i++) {
+            const date = new Date(startDate); date.setMonth(date.getMonth() + i);
+            mH.push(date.toLocaleString('default', { month: 'short', year: '2-digit' }));
+            reports.forEach(report => {
+                const reportDate = report.createdAt.toDate();
+                if (reportDate.getFullYear() === date.getFullYear() && reportDate.getMonth() === date.getMonth() && sD.has(report.shop)) {
+                    sD.get(report.shop)[i] += report.grandTotalKhr; mT[i] += report.grandTotalKhr;
+                }
+            });
+        }
+        return { monthHeaders: mH, summaryData: sD, monthlyTotals: mT };
+    }, [reports, shops, startDate]);
+
+    const exportableData = useMemo(() => {
+        const data = Array.from(summaryData.entries()).map(([shopName, monthData]) => {
+            const row = { 'Shop Name': shopName };
+            monthHeaders.forEach((header, i) => {
+                row[header] = monthData[i];
+            });
+            row['Total'] = monthData.reduce((a,b) => a+b, 0);
+            return row;
+        });
+        const totalsRow = { 'Shop Name': 'All Shops Total' };
+        monthHeaders.forEach((header, i) => {
+            totalsRow[header] = monthlyTotals[i];
+        });
+        totalsRow['Total'] = monthlyTotals.reduce((a,b) => a+b, 0);
+        data.push(totalsRow);
+        return data;
+    }, [summaryData, monthHeaders, monthlyTotals]);
+
+    const exportHeaders = useMemo(() => {
+        const headers = [{label: 'Shop Name', accessor: 'Shop Name'}];
+        monthHeaders.forEach(h => headers.push({label: h, accessor: h}));
+        headers.push({label: 'Total', accessor: 'Total'});
+        return headers;
+    }, [monthHeaders]);
+    
+    const years = [...new Set(reports.map(r => r.createdAt.toDate().getFullYear()))].sort((a,b) => b-a);
+    if(years.length === 0) years.push(new Date().getFullYear());
+    const months = Array.from({length: 12}, (e, i) => new Date(null, i, 1).toLocaleDateString("en", {month: "long"}));
+    return (<div><div className="flex justify-between items-center mb-4 flex-wrap gap-4"><h2 className="text-2xl font-bold">Monthly Cash Drop Summary</h2><button onClick={() => exportToCSV(exportHeaders, exportableData, 'monthly_summary')} className="flex items-center gap-2 bg-green-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-green-700"><Download size={18}/> Export</button></div><div className="flex gap-4 mb-6 p-4 bg-slate-50 rounded-lg"><div><label className="block text-sm font-medium text-gray-700 mb-1">Start Year</label><select onChange={handleYearChange} value={startDate.getFullYear()} className="w-full p-2 border rounded-md bg-white">{years.map(y => <option key={y} value={y}>{y}</option>)}</select></div><div><label className="block text-sm font-medium text-gray-700 mb-1">Start Month</label><select onChange={handleMonthChange} value={startDate.getMonth()} className="w-full p-2 border rounded-md bg-white">{months.map((m, i) => <option key={i} value={i}>{m}</option>)}</select></div></div><div className="overflow-x-auto"><table className="w-full text-left border-collapse"><thead><tr className="bg-gray-100"><th className="p-3 border">Shop</th>{monthHeaders.map(h => <th key={h} className="p-3 border text-right">{h}</th>)}<th className="p-3 border text-right font-bold">Total</th></tr></thead><tbody>{Array.from(summaryData.entries()).map(([sN, mD]) => { const sT = mD.reduce((a,b)=>a+b,0); return (<tr key={sN} className="border-b hover:bg-gray-50"><td className="p-2 border font-semibold">{sN}</td>{mD.map((t, i) => <td key={i} className="p-2 border text-right font-mono">{t > 0 ? t.toLocaleString(undefined,{minimumFractionDigits:0}) : '-'}</td>)}<td className="p-2 border text-right font-bold font-mono">{sT.toLocaleString(undefined,{minimumFractionDigits:0})}</td></tr>)})}</tbody><tfoot><tr className="bg-gray-200 font-bold"><td className="p-3 border">All Shops Total</td>{monthlyTotals.map((t, i) => <td key={i} className="p-3 border text-right font-mono">{t.toLocaleString(undefined,{minimumFractionDigits:0})}</td>)}<td className="p-3 border text-right font-mono">{monthlyTotals.reduce((a,b)=>a+b,0).toLocaleString(undefined,{minimumFractionDigits:0})}</td></tr></tfoot></table>{shops.length === 0 && <p className="text-center py-8 text-gray-500">Please add shops in Settings.</p>}</div></div>);
+}
+
+// --- Monthly Saving Page ---
+function MonthlySavingPage({ reports, cashExpenses, shops, exchangeRate }) {
+    const [selectedShopId, setSelectedShopId] = useState('all');
+    const [selectedYear, setSelectedYear] = useState(new Date().getFullYear());
+
+    const yearlyData = useMemo(() => {
+        const isAllShops = selectedShopId === 'all';
+        
+        const monthlyData = Array.from({ length: 12 }, (_, i) => ({
+            month: new Date(null, i, 1).toLocaleDateString("en", { month: "long" }),
+            netProfit: 0,
+            totalExpense: 0,
+            netIncome: 0,
+        }));
+
+        reports.forEach(r => {
+            const reportDate = r.createdAt.toDate();
+            if (reportDate.getFullYear() === selectedYear) {
+                const shopForReport = shops.find(s => s.name === r.shop);
+                if (shopForReport && (isAllShops || shopForReport.id === selectedShopId)) {
+                    const monthIndex = reportDate.getMonth();
+                    const netSale = r.grandTotalKhr;
+                    const saleMargin = shopForReport.saleMargin || 0;
+                    monthlyData[monthIndex].netProfit += netSale * (saleMargin / 100);
+                }
+            }
+        });
+        
+        cashExpenses.forEach(exp => {
+            const expenseDate = exp.createdAt.toDate();
+            if (expenseDate.getFullYear() === selectedYear) {
+                 if (isAllShops || exp.shopId === selectedShopId) {
+                    const monthIndex = expenseDate.getMonth();
+                    const totalExpenseKhr = (exp.amountUsd * exchangeRate) + exp.amountKhr;
+                    monthlyData[monthIndex].totalExpense += totalExpenseKhr;
+                 }
+            }
+        });
+
+        monthlyData.forEach(month => {
+            month.netIncome = month.netProfit - month.totalExpense;
+        });
+
+        return monthlyData;
+    }, [selectedShopId, selectedYear, reports, cashExpenses, shops, exchangeRate]);
+
+    const totals = useMemo(() => {
+        return yearlyData.reduce((acc, month) => {
+            acc.netProfit += month.netProfit;
+            acc.totalExpense += month.totalExpense;
+            acc.netIncome += month.netIncome;
+            return acc;
+        }, { netProfit: 0, totalExpense: 0, netIncome: 0 });
+    }, [yearlyData]);
+
+    const years = [...new Set(reports.map(r => r.createdAt.toDate().getFullYear()))].sort((a, b) => b - a);
+    if (!years.includes(new Date().getFullYear())) years.unshift(new Date().getFullYear());
+
+    return (
+        <div className="bg-white p-6 rounded-xl shadow-lg">
+            <div className="flex justify-between items-center mb-4">
+                <h2 className="text-2xl font-bold text-slate-800">Bank Deposite Saving</h2>
+                <button onClick={() => exportToCSV(
+                    [{label:'Month', accessor:'month'},{label:'Net-Profit (៛)', accessor:'netProfit'},{label:'Total Expense (៛)', accessor:'totalExpense'},{label:'Net-Income (Saving) (៛)', accessor:'netIncome'}], 
+                    [...yearlyData, { month: 'Total', ...totals }], 'monthly_saving_report'
+                    )} className="flex items-center gap-2 bg-green-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-green-700">
+                    <Download size={18}/> Export
+                </button>
+            </div>
+            <div className="flex gap-4 mb-6 p-4 bg-slate-50 rounded-lg items-end">
+                <FormSelect label="Shop" name="shopId" value={selectedShopId} onChange={e => setSelectedShopId(e.target.value)} options={['all', ...shops.map(s => s.id)]} optionLabels={['All Shops', ...shops.map(s => s.name)]} />
+                <FormSelect label="Year" name="year" value={selectedYear} onChange={e => setSelectedYear(parseInt(e.target.value))} options={years} />
+            </div>
+            <div className="overflow-x-auto">
+                <table className="w-full text-left">
+                    <thead className="bg-slate-100">
+                        <tr>
+                            <th className="p-3">Month</th>
+                            <th className="p-3 text-right">Net-Profit (៛)</th>
+                            <th className="p-3 text-right">Total Expense (៛)</th>
+                            <th className="p-3 text-right">Net-Income (Saving) (៛)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {yearlyData.map((data, i) => (
+                            <tr key={i} className="border-b">
+                                <td className="p-3 font-semibold">{data.month}</td>
+                                <td className="p-3 text-right font-mono">{data.netProfit.toLocaleString('en-US', {minimumFractionDigits: 2})}</td>
+                                <td className="p-3 text-right font-mono text-orange-600">{data.totalExpense.toLocaleString('en-US', {minimumFractionDigits: 2})}</td>
+                                <td className={`p-3 text-right font-bold ${data.netIncome >= 0 ? 'text-green-600' : 'text-red-600'}`}>{data.netIncome.toLocaleString('en-US', {minimumFractionDigits: 2})}</td>
+                            </tr>
+                        ))}
+                    </tbody>
+                    <tfoot className="bg-slate-200 font-bold">
+                        <tr>
+                            <td className="p-3">Total</td>
+                            <td className="p-3 text-right font-mono">{totals.netProfit.toLocaleString('en-US', {minimumFractionDigits: 2})}</td>
+                            <td className="p-3 text-right font-mono text-orange-600">{totals.totalExpense.toLocaleString('en-US', {minimumFractionDigits: 2})}</td>
+                            <td className={`p-3 text-right ${totals.netIncome >= 0 ? 'text-green-600' : 'text-red-600'}`}>{totals.netIncome.toLocaleString('en-US', {minimumFractionDigits: 2})}</td>
+                        </tr>
+                    </tfoot>
+                </table>
+            </div>
+        </div>
+    );
+}
+
+// --- Purchase Orders Page ---
+function PurchaseOrdersPage({ db, userId, vendors, purchaseOrders, shops, exchangeRate, monthlyClosures }) {
+    const [formData, setFormData] = useState({ vendorId: '', poDate: new Date().toISOString().split('T')[0], amountUsd: '', amountKhr: '', notes: '', shopId: '' });
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    const [editingPO, setEditingPO] = useState(null);
+    const [filters, setFilters] = useState({ vendorId: '', shopId: '', month: '', year: '' });
+    const [message, setMessage] = useState('');
+
+    useEffect(() => { 
+        if(vendors.length > 0 && !formData.vendorId) setFormData(f => ({ ...f, vendorId: vendors[0].id }));
+        if(shops.length > 0 && !formData.shopId) setFormData(f => ({ ...f, shopId: shops[0].id }));
+    }, [vendors, shops]);
+
+    const handleFilterChange = (e) => setFilters(prev => ({...prev, [e.target.name]: e.target.value}));
+    const handleChange = (e) => { const { name, value } = e.target; setFormData(f => ({ ...f, [name]: value })); };
+    
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        setMessage('');
+        if (isPeriodLocked(new Date(formData.poDate), formData.shopId, monthlyClosures)) {
+            setMessage('Cannot add entry to a closed period.');
+            return;
+        }
+        const amountUsd = parseFloat(formData.amountUsd) || 0, amountKhr = parseFloat(formData.amountKhr) || 0;
+        const selectedShop = shops.find(s => s.id === formData.shopId);
+        if (!formData.vendorId || !selectedShop || (!amountUsd && !amountKhr)) { alert("Select vendor, shop and enter an amount."); return; }
+        setIsSubmitting(true);
+        try { await addDoc(collection(db,`artifacts/${appId}/public/data/purchaseOrders`),{ ...formData, shopName: selectedShop.name, amountUsd, amountKhr, createdAt: new Date(), userId }); setFormData({ vendorId: vendors[0]?.id || '', shopId: shops[0]?.id || '', poDate: new Date().toISOString().split('T')[0], amountUsd: '', amountKhr: '', notes: '' }); } catch (e) { console.error(e); alert("Failed to add PO."); } finally { setIsSubmitting(false); }
+    };
+    const handleDelete = async (po) => {
+        if (isPeriodLocked(new Date(po.poDate), po.shopId, monthlyClosures)) { alert("Cannot delete entry from a closed period."); return; }
+        try { await deleteDoc(doc(db, `artifacts/${appId}/public/data/purchaseOrders`, po.id)); } catch(e) { console.error(e); alert("Delete failed.") }
+    };
+    const handleUpdate = async (updatedPO) => { const {id, ...data} = updatedPO; try { await updateDoc(doc(db,`artifacts/${appId}/public/data/purchaseOrders`, id), data); setEditingPO(null); } catch (e) { console.error(e); alert("Update failed.")}};
+    
+    const poWithDetails = useMemo(() => {
+        return purchaseOrders.map(po => {
+            const vendor = vendors.find(v => v.id === po.vendorId);
+            return {
+                ...po,
+                vendorName: vendor ? vendor.name : 'Unknown Vendor',
+                grandTotalKhr: (po.amountUsd * exchangeRate) + po.amountKhr
+            }
+        });
+    }, [purchaseOrders, vendors, exchangeRate]);
+
+    const filteredPOs = useMemo(() => {
+        return poWithDetails.filter(po => {
+            const poDate = new Date(po.poDate + 'T00:00:00');
+            return (
+                (filters.vendorId === '' || po.vendorId === filters.vendorId) &&
+                (filters.shopId === '' || po.shopId === filters.shopId) &&
+                (filters.month === '' || poDate.getMonth() === parseInt(filters.month)) &&
+                (filters.year === '' || poDate.getFullYear() === parseInt(filters.year))
+            );
+        });
+    }, [poWithDetails, filters]);
+    
+    const totals = useMemo(() => filteredPOs.reduce((acc, po) => {
+        acc.amountUsd += po.amountUsd || 0;
+        acc.amountKhr += po.amountKhr || 0;
+        acc.grandTotalKhr += po.grandTotalKhr || 0;
+        return acc;
+    }, { amountUsd: 0, amountKhr: 0, grandTotalKhr: 0 }), [filteredPOs]);
+
+    const poYears = [...new Set(purchaseOrders.map(po => new Date(po.poDate + 'T00:00:00').getFullYear()))].sort((a,b) => b-a);
+    const poMonths = Array.from({length: 12}, (e, i) => new Date(null, i, 1).toLocaleDateString("en", {month: "long"}));
+
+    return (<><div className="grid grid-cols-1 lg:grid-cols-3 gap-6"><div className="lg:col-span-1 bg-white p-6 rounded-lg shadow-md h-fit"><h2 className="text-2xl font-bold mb-4">New Purchase Order</h2><form onSubmit={handleSubmit} className="space-y-4"><FormSelect label="Vendor" name="vendorId" value={formData.vendorId} onChange={handleChange} options={vendors.map(v => v.id)} optionLabels={vendors.map(v => v.name)} /><FormSelect label="Shop" name="shopId" value={formData.shopId} onChange={handleChange} options={shops.map(s => s.id)} optionLabels={shops.map(s => s.name)} /><FormInput label="PO Date" type="date" name="poDate" value={formData.poDate} onChange={handleChange} /><FormInput label="Amount (USD)" type="number" name="amountUsd" value={formData.amountUsd} onChange={handleChange} /><FormInput label="Amount (KHR)" type="number" name="amountKhr" value={formData.amountKhr} onChange={handleChange} /><div><label className="block text-sm font-medium mb-1">Notes</label><textarea name="notes" value={formData.notes} onChange={handleChange} rows="3" className="w-full p-2 border rounded-md"></textarea></div><button type="submit" disabled={isSubmitting} className="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 disabled:bg-gray-400">{isSubmitting ? 'Saving...' : 'Save PO'}</button>{message && <p className="text-red-500 text-sm mt-2">{message}</p>}</form></div><div className="lg:col-span-2 bg-white p-6 rounded-lg shadow-md"><div className="flex justify-between items-center mb-4"><h2 className="text-2xl font-bold">All Purchase Orders</h2><button onClick={() => exportToCSV([{label:'PO Date', accessor:'poDate'}, {label:'Entry Time', accessor:'createdAt'}, {label:'Shop', accessor:'shopName'}, {label:'Vendor', accessor:'vendorName'}, {label:'USD', accessor:'amountUsd'}, {label:'KHR', accessor:'amountKhr'}, {label:'Total (៛)', accessor:'grandTotalKhr'}], filteredPOs.map(p => ({...p, createdAt: p.createdAt.toDate().toLocaleString()})), 'purchase_orders')} className="flex items-center gap-2 bg-green-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-green-700"><Download size={18}/> Export</button></div>
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-4 p-4 bg-slate-50 rounded-lg">
+        <FormSelect label="By Vendor" name="vendorId" value={filters.vendorId} onChange={handleFilterChange} options={['',...vendors.map(v=>v.id)]} optionLabels={['All Vendors',...vendors.map(v=>v.name)]} />
+        <FormSelect label="By Shop" name="shopId" value={filters.shopId} onChange={handleFilterChange} options={['',...shops.map(s=>s.id)]} optionLabels={['All Shops', ...shops.map(s=>s.name)]} />
+        <FormSelect label="By Month" name="month" value={filters.month} onChange={handleFilterChange} options={['',...poMonths.map((m,i)=>i)]} optionLabels={['All Months', ...poMonths]} />
+        <FormSelect label="By Year" name="year" value={filters.year} onChange={handleFilterChange} options={['',...poYears]} optionLabels={['All Years',...poYears]} />
+    </div>
+    <div className="overflow-x-auto"><table className="w-full text-left"><thead className="bg-gray-100"><tr><th className="p-2">PO Date</th><th className="p-2">Entry Time</th><th className="p-2">Shop</th><th className="p-2">Vendor</th><th className="p-2 text-right">USD</th><th className="p-2 text-right">KHR</th><th className="p-2 text-right">Total (៛)</th><th className="p-2"></th></tr></thead><tbody>{filteredPOs.map(po => {
+        const isLocked = isPeriodLocked(new Date(po.poDate), po.shopId, monthlyClosures);
+        return (<tr key={po.id} className={`${isLocked ? 'bg-slate-100 text-gray-500' : ''}`}><td className="p-2">{po.poDate}</td><td className="p-2 text-xs">{po.createdAt.toDate().toLocaleString()}</td><td className="p-2">{po.shopName}</td><td className="p-2">{po.vendorName}</td><td className="p-2 text-right font-mono">{po.amountUsd.toLocaleString()}</td><td className="p-2 text-right font-mono">{po.amountKhr.toLocaleString()}</td><td className="p-2 text-right font-semibold">{po.grandTotalKhr.toLocaleString('en-US', {minimumFractionDigits:2})}</td><td className="p-2"><div className="flex gap-1">{!isLocked ? (<><button onClick={()=>setEditingPO(po)} className="p-1 text-blue-600 hover:text-blue-800"><Edit size={16}/></button><button onClick={()=>handleDelete(po)} className="p-1 text-red-600 hover:text-red-800"><Trash2 size={16}/></button></>) : (<span className="text-xs italic">Locked</span>)}</div></td></tr>)})}</tbody>
+    <tfoot className="bg-gray-200 font-bold"><tr><td colSpan="4" className="p-2 text-right">Totals</td><td className="p-2 text-right font-mono">{totals.amountUsd.toLocaleString()} $</td><td className="p-2 text-right font-mono">{totals.amountKhr.toLocaleString()} ៛</td><td className="p-2 text-right">{totals.grandTotalKhr.toLocaleString('en-US', {minimumFractionDigits:2})} ៛</td><td></td></tr></tfoot>
+    </table>{poWithDetails.length === 0 && <p className="text-center py-8 text-gray-500">No purchase orders found.</p>}</div></div></div>
+    <Modal isOpen={!!editingPO} onClose={()=>setEditingPO(null)} title="Edit Purchase Order">
+       {editingPO && <EditPOForm po={editingPO} vendors={vendors} shops={shops} onSave={handleUpdate} onClose={()=>setEditingPO(null)} />}
+    </Modal>
+    </>);
+}
+
+function EditPOForm({ po, vendors, shops, onSave, onClose }) {
+    const [formData, setFormData] = useState(po);
+    const handleChange = (e) => { const { name, value } = e.target; setFormData(prev => ({...prev, [name]: value })); };
+    const handleSave = () => { 
+        const selectedShop = shops.find(s => s.id === formData.shopId);
+        onSave({...formData, amountUsd: parseFloat(formData.amountUsd) || 0, amountKhr: parseFloat(formData.amountKhr) || 0, shopName: selectedShop?.name || '' }); 
+    };
+    return (
+        <div className="space-y-4">
+            <FormSelect label="Vendor" name="vendorId" value={formData.vendorId} onChange={handleChange} options={vendors.map(v => v.id)} optionLabels={vendors.map(v => v.name)} />
+            <FormSelect label="Shop" name="shopId" value={formData.shopId} onChange={handleChange} options={shops.map(s => s.id)} optionLabels={shops.map(s => s.name)} />
+            <FormInput label="PO Date" type="date" name="poDate" value={formData.poDate} onChange={handleChange} />
+            <FormInput label="Amount (USD)" type="number" name="amountUsd" value={formData.amountUsd} onChange={handleChange} />
+            <FormInput label="Amount (KHR)" type="number" name="amountKhr" value={formData.amountKhr} onChange={handleChange} />
+            <div><label className="block text-sm font-medium mb-1">Notes</label><textarea name="notes" value={formData.notes} onChange={handleChange} rows="3" className="w-full p-2 border rounded-md"></textarea></div>
+            <div className="flex justify-end gap-4"><button onClick={onClose} className="px-4 py-2 rounded-md bg-gray-200 hover:bg-gray-300">Cancel</button><button onClick={handleSave} className="px-4 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-700">Save Changes</button></div>
+        </div>
+    );
+}
+
+// --- Internal Transfer Page ---
+function InternalTransferPage({ db, userId, shops, internalTransfers, exchangeRate, monthlyClosures }) {
+    const [formData, setFormData] = useState({ fromShopId: '', toShopId: '', transferDate: new Date().toISOString().split('T')[0], amountUsd: '', amountKhr: '', notes: '' });
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    const [editingTransfer, setEditingTransfer] = useState(null);
+    const [error, setError] = useState('');
+
+    useEffect(() => {
+        if(shops.length > 0) {
+            setFormData(f => ({ 
+                ...f, 
+                fromShopId: f.fromShopId || shops[0]?.id,
+                toShopId: f.toShopId || (shops.length > 1 ? shops[1]?.id : '')
+            }));
+        }
+    }, [shops]);
+
+    const handleChange = (e) => { 
+        const { name, value } = e.target; 
+        setFormData(f => ({ ...f, [name]: value })); 
+        if(name === 'fromShopId' && value === formData.toShopId) {
+            setError('From and To shops cannot be the same.');
+        } else if (name === 'toShopId' && value === formData.fromShopId) {
+            setError('To and From shops cannot be the same.');
+        } else {
+            setError('');
+        }
+    };
+    
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        setError('');
+        if (isPeriodLocked(new Date(formData.transferDate), formData.fromShopId, monthlyClosures) || isPeriodLocked(new Date(formData.transferDate), formData.toShopId, monthlyClosures)) {
+            setError('Cannot add transfer to a closed period.');
+            return;
+        }
+        if (formData.fromShopId === formData.toShopId) {
+            alert("From and To shops cannot be the same.");
+            return;
+        }
+        const fromShop = shops.find(s => s.id === formData.fromShopId);
+        const toShop = shops.find(s => s.id === formData.toShopId);
+        const amountUsd = parseFloat(formData.amountUsd) || 0, amountKhr = parseFloat(formData.amountKhr) || 0;
+        
+        if (!fromShop || !toShop || (!amountUsd && !amountKhr)) { 
+            alert("Please select valid shops and enter an amount."); return; 
+        }
+        setIsSubmitting(true);
+        try { 
+            await addDoc(collection(db,`artifacts/${appId}/public/data/internalTransfers`),{ 
+                ...formData, 
+                amountUsd, 
+                amountKhr, 
+                fromShopName: fromShop.name,
+                toShopName: toShop.name,
+                createdAt: new Date(), 
+                userId 
+            }); 
+            setFormData({ 
+                fromShopId: shops[0]?.id || '', 
+                toShopId: shops[1]?.id || '', 
+                transferDate: new Date().toISOString().split('T')[0], 
+                amountUsd: '', 
+                amountKhr: '', 
+                notes: '' 
+            }); 
+        } catch (e) { console.error(e); alert("Failed to add transfer."); } 
+        finally { setIsSubmitting(false); }
+    };
+
+    const handleDelete = async (t) => {
+        if (isPeriodLocked(new Date(t.transferDate), t.fromShopId, monthlyClosures) || isPeriodLocked(new Date(t.transferDate), t.toShopId, monthlyClosures)) {
+            alert("Cannot delete entry from a closed period.");
+            return;
+        }
+        try { await deleteDoc(doc(db, `artifacts/${appId}/public/data/internalTransfers`, t.id)); } catch(e) { console.error(e); alert("Delete failed.") }
+    };
+    const handleUpdate = async (updatedTransfer) => { const {id, ...data} = updatedTransfer; try { await updateDoc(doc(db,`artifacts/${appId}/public/data/internalTransfers`, id), data); setEditingTransfer(null); } catch (e) { console.error(e); alert("Update failed.")}};
+    
+    const transfersWithTotals = useMemo(() => internalTransfers.map(t => ({
+        ...t,
+        grandTotalKhr: (t.amountUsd * exchangeRate) + t.amountKhr
+    })), [internalTransfers, exchangeRate]);
+
+    return (<><div className="grid grid-cols-1 lg:grid-cols-3 gap-6"><div className="lg:col-span-1 bg-white p-6 rounded-lg shadow-md h-fit"><h2 className="text-2xl font-bold mb-4">New Internal Transfer</h2><form onSubmit={handleSubmit} className="space-y-4"><FormSelect label="From Shop" name="fromShopId" value={formData.fromShopId} onChange={handleChange} options={shops.map(s => s.id)} optionLabels={shops.map(s => s.name)} /><FormSelect label="To Shop" name="toShopId" value={formData.toShopId} onChange={handleChange} options={shops.map(s => s.id)} optionLabels={shops.map(s => s.name)} /><FormInput label="Transfer Date" type="date" name="transferDate" value={formData.transferDate} onChange={handleChange} /><FormInput label="Amount (USD)" type="number" name="amountUsd" value={formData.amountUsd} onChange={handleChange} /><FormInput label="Amount (KHR)" type="number" name="amountKhr" value={formData.amountKhr} onChange={handleChange} /><div><label className="block text-sm font-medium mb-1">Notes</label><textarea name="notes" value={formData.notes} onChange={handleChange} rows="3" className="w-full p-2 border rounded-md"></textarea></div><button type="submit" disabled={isSubmitting || !!error} className="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 disabled:bg-gray-400">{isSubmitting ? 'Saving...' : 'Save Transfer'}</button>{error && <p className="text-red-500 text-sm mt-2">{error}</p>}</form></div><div className="lg:col-span-2 bg-white p-6 rounded-lg shadow-md"><div className="flex justify-between items-center mb-4"><h2 className="text-2xl font-bold">Internal Transfer History</h2><button onClick={() => exportToCSV([{label:'Date', accessor:'transferDate'}, {label:'From', accessor:'fromShopName'}, {label:'To', accessor:'toShopName'}, {label:'USD', accessor:'amountUsd'}, {label:'KHR', accessor:'amountKhr'}, {label:'Total (៛)', accessor:'grandTotalKhr'}, {label:'Notes', accessor:'notes'}], transfersWithTotals, 'internal_transfers')} className="flex items-center gap-2 bg-green-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-green-700"><Download size={18}/> Export</button></div>
+    <div className="overflow-x-auto"><table className="w-full text-left"><thead className="bg-gray-100"><tr><th className="p-2">Date</th><th className="p-2">From</th><th className="p-2">To</th><th className="p-2 text-right">USD</th><th className="p-2 text-right">KHR</th><th className="p-2 text-right">Total (៛)</th><th className="p-2"></th></tr></thead><tbody>{transfersWithTotals.map(t => {
+        const isLocked = isPeriodLocked(new Date(t.transferDate), t.fromShopId, monthlyClosures) || isPeriodLocked(new Date(t.transferDate), t.toShopId, monthlyClosures);
+        return (<tr key={t.id} className={`${isLocked ? 'bg-slate-100 text-gray-500' : ''}`}><td className="p-2">{t.transferDate}</td><td className="p-2">{t.fromShopName}</td><td className="p-2">{t.toShopName}</td><td className="p-2 text-right font-mono">{t.amountUsd.toLocaleString()}</td><td className="p-2 text-right font-mono">{t.amountKhr.toLocaleString()}</td><td className="p-2 text-right font-semibold">{t.grandTotalKhr.toLocaleString('en-US', {minimumFractionDigits:2})}</td><td className="p-2"><div className="flex gap-1">{!isLocked ? (<><button onClick={()=>setEditingTransfer(t)} className="p-1 text-blue-600 hover:text-blue-800"><Edit size={16}/></button><button onClick={()=>handleDelete(t)} className="p-1 text-red-600 hover:text-red-800"><Trash2 size={16}/></button></>) : (<span className="text-xs italic">Locked</span>)}</div></td></tr>)})}</tbody></table>{internalTransfers.length === 0 && <p className="text-center py-8 text-gray-500">No transfers recorded.</p>}</div></div></div>
+    <Modal isOpen={!!editingTransfer} onClose={()=>setEditingTransfer(null)} title="Edit Internal Transfer">
+       {editingTransfer && <EditTransferForm transfer={editingTransfer} shops={shops} onSave={handleUpdate} onClose={()=>setEditingTransfer(null)} />}
+    </Modal>
+    </>);
+}
+
+function EditTransferForm({ transfer, shops, onSave, onClose }) {
+    const [formData, setFormData] = useState(transfer);
+    const handleChange = (e) => { const { name, value } = e.target; setFormData(prev => ({...prev, [name]: value })); };
+    const handleSave = () => { 
+        const fromShop = shops.find(s => s.id === formData.fromShopId);
+        const toShop = shops.find(s => s.id === formData.toShopId);
+        onSave({...formData, amountUsd: parseFloat(formData.amountUsd) || 0, amountKhr: parseFloat(formData.amountKhr) || 0, fromShopName: fromShop?.name || '', toShopName: toShop?.name || '' }); 
+    };
+    return (
+        <div className="space-y-4">
+            <FormSelect label="From Shop" name="fromShopId" value={formData.fromShopId} onChange={handleChange} options={shops.map(s => s.id)} optionLabels={shops.map(s => s.name)} />
+            <FormSelect label="To Shop" name="toShopId" value={formData.toShopId} onChange={handleChange} options={shops.map(s => s.id)} optionLabels={shops.map(s => s.name)} />
+            <FormInput label="Transfer Date" type="date" name="transferDate" value={formData.transferDate} onChange={handleChange} />
+            <FormInput label="Amount (USD)" type="number" name="amountUsd" value={formData.amountUsd} onChange={handleChange} />
+            <FormInput label="Amount (KHR)" type="number" name="amountKhr" value={formData.amountKhr} onChange={handleChange} />
+            <div><label className="block text-sm font-medium mb-1">Notes</label><textarea name="notes" value={formData.notes} onChange={handleChange} rows="3" className="w-full p-2 border rounded-md"></textarea></div>
+            <div className="flex justify-end gap-4"><button onClick={onClose} className="px-4 py-2 rounded-md bg-gray-200 hover:bg-gray-300">Cancel</button><button onClick={handleSave} className="px-4 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-700">Save Changes</button></div>
+        </div>
+    );
+}
+
+
+// --- Cash Expenses Page ---
+function CashExpensesPage({ db, userId, expenseCategories, cashExpenses, shops, exchangeRate, monthlyClosures }) {
+    const [formData, setFormData] = useState({ categoryId: '', expenseDate: new Date().toISOString().split('T')[0], amountUsd: '', amountKhr: '', notes: '', shopId: '' });
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    const [editingExpense, setEditingExpense] = useState(null);
+    const [filters, setFilters] = useState({ categoryId: '', shopId: '', month: '', year: '' });
+    const [message, setMessage] = useState('');
+    
+    useEffect(() => { 
+        if(expenseCategories.length > 0 && !formData.categoryId) setFormData(f => ({ ...f, categoryId: expenseCategories[0].id }));
+        if(shops.length > 0 && !formData.shopId) setFormData(f => ({ ...f, shopId: shops[0].id }));
+    }, [expenseCategories, shops]);
+    
+    const handleFilterChange = (e) => setFilters(prev => ({...prev, [e.target.name]: e.target.value}));
+    const handleChange = (e) => { const { name, value } = e.target; setFormData(f => ({ ...f, [name]: value })); };
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        setMessage('');
+        if (isPeriodLocked(new Date(formData.expenseDate), formData.shopId, monthlyClosures)) {
+            setMessage('Cannot add entry to a closed period.');
+            return;
+        }
+        const amountUsd = parseFloat(formData.amountUsd)||0, amountKhr = parseFloat(formData.amountKhr)||0;
+        const selectedShop = shops.find(s => s.id === formData.shopId);
+        if (!formData.categoryId || !selectedShop || (!amountUsd && !amountKhr)) { alert("Select category, shop, and enter amount."); return; }
+        setIsSubmitting(true);
+        try { await addDoc(collection(db,`artifacts/${appId}/public/data/cashExpenses`),{ ...formData, shopName: selectedShop.name, amountUsd, amountKhr, createdAt: new Date(), userId }); setFormData({ categoryId: expenseCategories[0]?.id||'', shopId: shops[0]?.id || '', expenseDate: new Date().toISOString().split('T')[0], amountUsd: '', amountKhr: '', notes: '' }); } catch (e) { console.error(e); alert("Failed to add expense."); } finally { setIsSubmitting(false); }
+    };
+    const handleDelete = async (exp) => {
+        if(isPeriodLocked(new Date(exp.expenseDate), exp.shopId, monthlyClosures)) { alert("Cannot delete entry from a closed period."); return; }
+        try { await deleteDoc(doc(db,`artifacts/${appId}/public/data/cashExpenses`, exp.id)); } catch(e){console.error(e);alert("Delete failed.")}
+    };
+    const handleUpdate = async (updatedExpense) => { const {id, ...data} = updatedExpense; try { await updateDoc(doc(db,`artifacts/${appId}/public/data/cashExpenses`, id), data); setEditingExpense(null); } catch (e) { console.error(e); alert("Update failed.")}};
+    
+    const expenseWithDetails = useMemo(() => {
+        return cashExpenses.map(exp => ({
+            ...exp,
+            subtotalKhr: (exp.amountUsd * exchangeRate) + exp.amountKhr,
+            categoryName: expenseCategories.find(c => c.id === exp.categoryId)?.name || 'N/A'
+        }))
+    }, [cashExpenses, exchangeRate, expenseCategories]);
+
+    const filteredExpenses = useMemo(() => {
+        return expenseWithDetails.filter(exp => {
+            const expDate = new Date(exp.expenseDate + 'T00:00:00');
+            return (
+                (filters.categoryId === '' || exp.categoryId === filters.categoryId) &&
+                (filters.shopId === '' || exp.shopId === filters.shopId) &&
+                (filters.month === '' || expDate.getMonth() === parseInt(filters.month)) &&
+                (filters.year === '' || expDate.getFullYear() === parseInt(filters.year))
+            );
+        });
+    }, [expenseWithDetails, filters]);
+
+    const grandTotal = useMemo(() => filteredExpenses.reduce((sum, exp) => sum + exp.subtotalKhr, 0), [filteredExpenses]);
+    
+    const expYears = [...new Set(cashExpenses.map(e => new Date(e.expenseDate + 'T00:00:00').getFullYear()))].sort((a,b) => b-a);
+    const expMonths = Array.from({length: 12}, (e, i) => new Date(null, i, 1).toLocaleDateString("en", {month: "long"}));
+
+    return (<><div className="grid grid-cols-1 lg:grid-cols-3 gap-6"><div className="lg:col-span-1 bg-white p-6 rounded-lg shadow-md h-fit"><h2 className="text-2xl font-bold mb-4">New Cash Expense</h2><form onSubmit={handleSubmit} className="space-y-4"><FormSelect label="Category" name="categoryId" value={formData.categoryId} onChange={handleChange} options={expenseCategories.map(c => c.id)} optionLabels={expenseCategories.map(c => c.name)} /><FormSelect label="Shop" name="shopId" value={formData.shopId} onChange={handleChange} options={shops.map(s => s.id)} optionLabels={shops.map(s => s.name)} /><FormInput label="Expense Date" type="date" name="expenseDate" value={formData.expenseDate} onChange={handleChange} /><FormInput label="Amount (USD)" type="number" name="amountUsd" value={formData.amountUsd} onChange={handleChange} /><FormInput label="Amount (KHR)" type="number" name="amountKhr" value={formData.amountKhr} onChange={handleChange} /><div><label className="block text-sm font-medium mb-1">Notes</label><textarea name="notes" value={formData.notes} onChange={handleChange} rows="3" className="w-full p-2 border rounded-md"></textarea></div><button type="submit" disabled={isSubmitting} className="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 disabled:bg-gray-400">{isSubmitting ? 'Saving...' : 'Save Expense'}</button>{message && <p className="text-red-500 text-sm mt-2">{message}</p>}</form></div><div className="lg:col-span-2 bg-white p-6 rounded-lg shadow-md"><div className="flex justify-between items-center mb-4"><h2 className="text-2xl font-bold">Cash Expense Report</h2><button onClick={() => exportToCSV([{label: 'No.', accessor: 'index'},{label:'Date & Time', accessor:'createdAt'}, {label:'Shop Name', accessor:'shopName'},{label:'Category',accessor:'categoryName'},{label:'USD', accessor:'amountUsd'}, {label:'KHR', accessor:'amountKhr'},{label:'Subtotal (៛)', accessor:'subtotalKhr'}, {label:'Note', accessor:'notes'}], filteredExpenses.map((e,i)=>({...e, index:i+1, createdAt: e.createdAt.toDate().toLocaleString()})), 'cash_expenses_report')} className="flex items-center gap-2 bg-green-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-green-700"><Download size={18}/> Export</button></div>
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-4 p-4 bg-slate-50 rounded-lg">
+        <FormSelect label="By Shop" name="shopId" value={filters.shopId} onChange={handleFilterChange} options={['',...shops.map(s=>s.id)]} optionLabels={['All Shops', ...shops.map(s=>s.name)]} />
+        <FormSelect label="By Category" name="categoryId" value={filters.categoryId} onChange={handleFilterChange} options={['',...expenseCategories.map(c=>c.id)]} optionLabels={['All Categories', ...expenseCategories.map(c=>c.name)]} />
+        <FormSelect label="By Month" name="month" value={filters.month} onChange={handleFilterChange} options={['',...expMonths.map((m,i)=>i)]} optionLabels={['All Months', ...expMonths]} />
+        <FormSelect label="By Year" name="year" value={filters.year} onChange={handleFilterChange} options={['',...expYears]} optionLabels={['All Years', ...expYears]} />
+    </div>
+    <div className="overflow-x-auto"><table className="w-full text-left"><thead className="bg-gray-50"><tr><th className="p-2">No.</th><th className="p-2">Date & Time</th><th className="p-2">Shop Name</th><th className="p-2">Category</th><th className="p-2 text-right">USD</th><th className="p-2 text-right">KHR</th><th className="p-2 text-right">Subtotal (៛)</th><th className="p-2">Note</th><th className="p-2"></th></tr></thead><tbody>{filteredExpenses.map((exp, i) => {
+        const isLocked = isPeriodLocked(new Date(exp.expenseDate), exp.shopId, monthlyClosures);
+        return (<tr key={exp.id} className={`${isLocked ? 'bg-slate-100 text-gray-500' : ''}`}><td className="p-2">{i+1}</td><td className="p-2">{exp.createdAt.toDate().toLocaleString()}</td><td className="p-2">{exp.shopName}</td><td className="p-2">{exp.categoryName}</td><td className="p-2 text-right font-mono">{exp.amountUsd.toLocaleString()}</td><td className="p-2 text-right font-mono">{exp.amountKhr.toLocaleString()}</td><td className="p-2 text-right font-semibold">{exp.subtotalKhr.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}</td><td className="p-2 text-gray-600">{exp.notes}</td><td className="p-2"><div className="flex gap-1">{!isLocked ? (<><button onClick={()=>setEditingExpense(exp)} className="p-1 text-blue-600"><Edit size={16}/></button><button onClick={()=>handleDelete(exp)} className="p-1 text-red-600"><Trash2 size={16}/></button></>) : (<span className="text-xs italic">Locked</span>)}</div></td></tr>)})}</tbody>
+    <tfoot className="bg-gray-200 font-bold"><tr><td colSpan="6" className="p-2 text-right">Grand Total</td><td className="p-2 text-right">{grandTotal.toLocaleString('en-US', {minimumFractionDigits: 2})} ៛</td><td colSpan="2"></td></tr></tfoot>
+    </table>{expenseWithDetails.length === 0 && <p className="text-center py-8 text-gray-500">No cash expenses found.</p>}</div></div></div>
+    <Modal isOpen={!!editingExpense} onClose={()=>setEditingExpense(null)} title="Edit Cash Expense">
+       {editingExpense && <EditExpenseForm expense={editingExpense} categories={expenseCategories} shops={shops} onSave={handleUpdate} onClose={()=>setEditingExpense(null)} />}
+    </Modal>
+    </>);
+}
+
+function EditExpenseForm({ expense, categories, shops, onSave, onClose }) {
+    const [formData, setFormData] = useState(expense);
+    const handleChange = (e) => { const { name, value } = e.target; setFormData(prev => ({...prev, [name]: value })); };
+    const handleSave = () => { 
+        const selectedShop = shops.find(s => s.id === formData.shopId);
+        onSave({...formData, amountUsd: parseFloat(formData.amountUsd) || 0, amountKhr: parseFloat(formData.amountKhr) || 0, shopName: selectedShop?.name || ''}); 
+    };
+    return (
+        <div className="space-y-4">
+            <FormSelect label="Category" name="categoryId" value={formData.categoryId} onChange={handleChange} options={categories.map(c => c.id)} optionLabels={categories.map(c => c.name)} />
+            <FormSelect label="Shop" name="shopId" value={formData.shopId} onChange={handleChange} options={shops.map(s => s.id)} optionLabels={shops.map(s => s.name)} />
+            <FormInput label="Expense Date" type="date" name="expenseDate" value={formData.expenseDate} onChange={handleChange} />
+            <FormInput label="Amount (USD)" type="number" name="amountUsd" value={formData.amountUsd} onChange={handleChange} />
+            <FormInput label="Amount (KHR)" type="number" name="amountKhr" value={formData.amountKhr} onChange={handleChange} />
+            <div><label className="block text-sm font-medium mb-1">Notes</label><textarea name="notes" value={formData.notes} onChange={handleChange} rows="3" className="w-full p-2 border rounded-md"></textarea></div>
+            <div className="flex justify-end gap-4"><button onClick={onClose} className="px-4 py-2 rounded-md bg-gray-200 hover:bg-gray-300">Cancel</button><button onClick={handleSave} className="px-4 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-700">Save Changes</button></div>
+        </div>
+    );
+}
+
+// --- HR Management Page ---
+function StaffForm({ onSave, onClose, initialData, shops, positions, userId, db }) {
+    const defaultData = {
+        name: '', position: '', shopIds: [], contact: '', address: '',
+        startDate: new Date().toISOString().split('T')[0], status: 'Active',
+        salaryUsd: '', salaryKhr: '', nationalId: '', emergencyContact: '',
+        workingHoursIn: '08:00', workingHoursOut: '17:00',
+        email: '', role: 'Staff',
+    };
+
+    const [formData, setFormData] = useState(() => {
+        const data = initialData ? { ...defaultData, ...initialData } : defaultData;
+        if (initialData && initialData.shopId && !initialData.shopIds) {
+            data.shopIds = [initialData.shopId];
+        }
+        if(!initialData && shops.length > 0) {
+            data.shopIds = [shops[0].id];
+        }
+        if(!initialData && positions.length > 0) {
+            data.position = positions[0].name;
+        }
+        return data;
+    });
+
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    
+    const handleChange = (e) => {
+        const { name, value } = e.target;
+        setFormData(prev => ({ ...prev, [name]: value }));
+    };
+
+    const handleShopSelectionChange = (shopId) => {
+        setFormData(prev => {
+            const shopIds = prev.shopIds || [];
+            const newShopIds = shopIds.includes(shopId) 
+                ? shopIds.filter(id => id !== shopId)
+                : [...shopIds, shopId];
+            return { ...prev, shopIds: newShopIds };
+        });
+    };
+
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        if (!formData.name || formData.shopIds.length === 0 || !formData.position || !formData.email || !formData.role) {
+            alert("Name, Position, at least one Shop, Email, and Role are required.");
+            return;
+        }
+        setIsSubmitting(true);
+        const dataToSave = {
+            ...formData,
+            salaryUsd: parseFloat(formData.salaryUsd) || 0,
+            salaryKhr: parseFloat(formData.salaryKhr) || 0,
+            updatedAt: new Date(),
+        };
+        delete dataToSave.shopId; // Remove legacy field
+
+        try {
+            if (dataToSave.id) { // Editing existing staff
+                const { id, ...data } = dataToSave;
+                const staffRef = doc(db, `artifacts/${appId}/public/data/staff`, id);
+                await updateDoc(staffRef, data);
+            } else { // Creating new staff
+                await addDoc(collection(db, `artifacts/${appId}/public/data/staff`), { ...dataToSave, createdAt: new Date(), userId });
+            }
+            onSave();
+        } catch (error) {
+            console.error("Error saving staff:", error);
+            alert("Failed to save staff member.");
+        } finally {
+            setIsSubmitting(false);
+        }
+    };
+
+    return (
+        <form onSubmit={handleSubmit} className="space-y-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <FormInput label="Full Name" name="name" value={formData.name} onChange={handleChange} required />
+                <FormSelect label="Position / Job Title" name="position" value={formData.position} onChange={handleChange} options={positions.map(p => p.name)} required />
+                <FormSelect label="Employment Status" name="status" value={formData.status} onChange={handleChange} options={['Active', 'Terminated', 'On Leave']} />
+                <FormInput label="Start Date" type="date" name="startDate" value={formData.startDate} onChange={handleChange} />
+                <FormInput label="Contact Phone" name="contact" value={formData.contact} onChange={handleChange} />
+                <FormInput label="National ID" name="nationalId" value={formData.nationalId} onChange={handleChange} />
+                <FormInput label="Emergency Contact" name="emergencyContact" value={formData.emergencyContact} onChange={handleChange} />
+            </div>
+            <div>
+                 <h4 className="font-medium text-gray-700 mb-2">Login & Role</h4>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 border rounded-md">
+                     <FormInput label="Email (for login)" type="email" name="email" value={formData.email} onChange={handleChange} required />
+                     <FormSelect label="Role" name="role" value={formData.role} onChange={handleChange} options={['Admin', 'Shop Manager', 'Staff']} required />
+                </div>
+            </div>
+             <div>
+                 <h4 className="font-medium text-gray-700 mb-2">Assigned Shops</h4>
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-2 p-4 border rounded-md max-h-32 overflow-y-auto">
+                    {shops.map(shop => (
+                        <label key={shop.id} className="flex items-center gap-2 p-2 rounded-md hover:bg-gray-100">
+                            <input type="checkbox" checked={formData.shopIds?.includes(shop.id) || false} onChange={() => handleShopSelectionChange(shop.id)} className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"/>
+                            <span>{shop.name}</span>
+                        </label>
+                    ))}
+                </div>
+            </div>
+            <div>
+                 <h4 className="font-medium text-gray-700 mb-2">Work & Salary</h4>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 p-4 border rounded-md">
+                     <FormInput label="Working Hours In" type="time" name="workingHoursIn" value={formData.workingHoursIn} onChange={handleChange} />
+                     <FormInput label="Working Hours Out" type="time" name="workingHoursOut" value={formData.workingHoursOut} onChange={handleChange} />
+                     <FormInput label="Salary (USD)" type="number" name="salaryUsd" value={formData.salaryUsd} onChange={handleChange} />
+                     <FormInput label="Salary (KHR)" type="number" name="salaryKhr" value={formData.salaryKhr} onChange={handleChange} />
+                </div>
+            </div>
+             <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Address</label>
+                <textarea name="address" value={formData.address} onChange={handleChange} rows="2" className="w-full p-2 border border-gray-300 rounded-md"></textarea>
+            </div>
+            <div className="flex justify-end gap-4 pt-4">
+                <button type="button" onClick={onClose} className="px-4 py-2 rounded-md bg-gray-200 hover:bg-gray-300">Cancel</button>
+                <button type="submit" disabled={isSubmitting} className="px-4 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:bg-gray-400">
+                    {isSubmitting ? 'Saving...' : 'Save Employee'}
+                </button>
+            </div>
+        </form>
+    );
+}
+
+function HRManagementPage({ db, userId, staff, shops, positions }) {
+    const [isModalOpen, setIsModalOpen] = useState(false);
+    const [editingStaff, setEditingStaff] = useState(null);
+
+    const handleAddNew = () => {
+        setEditingStaff(null);
+        setIsModalOpen(true);
+    };
+
+    const handleEdit = (staffMember) => {
+        setEditingStaff(staffMember);
+        setIsModalOpen(true);
+    };
+
+    const handleDelete = async (id) => {
+        if (window.confirm("Are you sure you want to delete this staff member?")) {
+            try {
+                await deleteDoc(doc(db, `artifacts/${appId}/public/data/staff`, id));
+            } catch (e) {
+                console.error("Error deleting staff member: ", e);
+                alert("Failed to delete staff member.");
+            }
+        }
+    };
+    
+    const handleSave = () => {
+        setIsModalOpen(false);
+        setEditingStaff(null);
+    };
+
+    const staffWithDetails = useMemo(() => {
+        return staff.map(s => {
+            const shopNames = s.shopIds?.map(id => shops.find(shop => shop.id === id)?.name || 'N/A').join(', ') || 'N/A';
+            return { ...s, shopNames };
+        });
+    }, [staff, shops]);
+
+    return (
+        <div className="bg-white p-6 rounded-xl shadow-lg">
+            <div className="flex justify-between items-center mb-6">
+                <h2 className="text-2xl font-bold text-slate-800">HR Management</h2>
+                <button onClick={handleAddNew} className="flex items-center gap-2 bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700">
+                    <PlusCircle size={18} /> Add New Staff
+                </button>
+            </div>
+            <div className="overflow-x-auto">
+                <table className="w-full text-left">
+                    <thead className="bg-slate-100">
+                        <tr>
+                            <th className="p-3">Name</th>
+                            <th className="p-3">Email</th>
+                            <th className="p-3">Role</th>
+                            <th className="p-3">Position</th>
+                            <th className="p-3">Shops</th>
+                            <th className="p-3">Status</th>
+                            <th className="p-3">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {staffWithDetails.map(s => (
+                            <tr key={s.id} className="border-b hover:bg-slate-50">
+                                <td className="p-3 font-semibold">{s.name}</td>
+                                <td className="p-3 text-sm text-gray-600">{s.email}</td>
+                                <td className="p-3">
+                                    <span className={`px-2 py-1 text-xs font-semibold rounded-full ${s.role === 'Admin' ? 'bg-purple-100 text-purple-800' : s.role === 'Shop Manager' ? 'bg-blue-100 text-blue-800' : 'bg-gray-100 text-gray-800'}`}>
+                                        {s.role}
+                                    </span>
+                                </td>
+                                <td className="p-3">{s.position}</td>
+                                <td className="p-3">{s.shopNames}</td>
+                                <td className="p-3">
+                                    <span className={`px-2 py-1 text-xs font-semibold rounded-full ${s.status === 'Active' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}`}>
+                                        {s.status}
+                                    </span>
+                                </td>
+                                <td className="p-3">
+                                    <div className="flex gap-2">
+                                        <button onClick={() => handleEdit(s)} className="p-1 text-blue-600 hover:text-blue-800"><Edit size={16}/></button>
+                                        <button onClick={() => handleDelete(s.id)} className="p-1 text-red-600 hover:text-red-800"><Trash2 size={16}/></button>
+                                    </div>
+                                </td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+                 {staff.length === 0 && <p className="text-center py-8 text-gray-500">No staff members found.</p>}
+            </div>
+            <Modal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} title={editingStaff ? 'Edit Staff Profile' : 'Add New Staff'} size="2xl">
+                <StaffForm
+                    onSave={handleSave}
+                    onClose={() => setIsModalOpen(false)}
+                    initialData={editingStaff}
+                    shops={shops}
+                    positions={positions}
+                    userId={userId}
+                    db={db}
+                />
+            </Modal>
+        </div>
+    );
+}
+
+// --- Settings Component ---
+function Settings({ db, userId, shops, shifts, expenseCategories, positions, exchangeRate, setExchangeRate }) {
+    const handleRateChange = async (e) => { const newRate = parseFloat(e.target.value) || 0; setExchangeRate(newRate); try { await setDoc(doc(db,`artifacts/${appId}/public/data/settings`,'exchangeRate'),{rate:newRate});}catch(e){console.error(e);}};
+    return (
+        <div className="space-y-6">
+            <div className="bg-white p-6 rounded-lg shadow-md"><h2 className="text-2xl font-bold mb-2">Global Settings</h2><div className="max-w-xs"><FormInput label="USD to KHR Exchange Rate" type="number" name="exchangeRate" value={exchangeRate} onChange={handleRateChange} /></div></div>
+             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <ShopManager db={db} userId={userId} shops={shops} />
+                <SettingsManager title="Shifts" icon={<Clock/>} items={shifts} collectionName="shifts" db={db} userId={userId} />
+                <SettingsManager title="Expense Categories" icon={<Wallet/>} items={expenseCategories} collectionName="expenseCategories" db={db} userId={userId} />
+                <SettingsManager title="Positions" icon={<Briefcase/>} items={positions} collectionName="positions" db={db} userId={userId} />
+            </div>
+        </div>
+    );
+}
+
+// --- Reusable manager ---
+function SettingsManager({ title, icon, items, collectionName, db, userId }) {
+    const [newItem, setNewItem] = useState('');
+    const addItem = async () => { if (newItem.trim()==='')return; try{await addDoc(collection(db,`artifacts/${appId}/public/data/${collectionName}`),{name:newItem,createdAt:new Date(),userId});setNewItem('');}catch(e){console.error(e);}};
+    const deleteItem = async(id) => { try{await deleteDoc(doc(db,`artifacts/${appId}/public/data/${collectionName}`,id));}catch(e){console.error(e)}};
+    return (<div className="bg-white p-6 rounded-lg shadow-md"><div className="flex items-center gap-3 mb-4"><div className="text-blue-600">{icon}</div><h3 className="text-xl font-bold">{title}</h3></div><ul className="space-y-2 mb-4 h-40 overflow-y-auto pr-2">{items.map(i=>(<li key={i.id} className="flex justify-between items-center bg-gray-100 p-2 rounded-md"><span>{i.name}</span><button onClick={()=>deleteItem(i.id)} className="text-red-500 hover:text-red-700"><Trash2 size={16}/></button></li>))}{items.length === 0 && <p className="text-center py-2 text-gray-500 text-sm">No {title.toLowerCase()} added.</p>}</ul><div className="flex gap-2"><input type="text" value={newItem} onChange={e=>setNewItem(e.target.value)} onKeyPress={e=>e.key==='Enter'&&addItem()} placeholder={`New ${title.slice(0,-1)}`} className="flex-grow p-2 border rounded-md"/><button onClick={addItem} className="bg-blue-600 text-white p-2 rounded-md hover:bg-blue-700"><PlusCircle size={20}/></button></div></div>);
+}
+
+// --- Shop Manager with Sale Margin ---
+function ShopManager({ db, userId, shops }) {
+    const [newItem, setNewItem] = useState({ name: '', saleMargin: '' });
+    const handleAdd = async () => {
+        if (!newItem.name.trim() || !newItem.saleMargin) { alert("Provide shop name and sale margin."); return; }
+        try { await addDoc(collection(db, `artifacts/${appId}/public/data/shops`), { name: newItem.name, saleMargin: parseFloat(newItem.saleMargin) || 0, createdAt: new Date(), userId }); setNewItem({ name: '', saleMargin: '' }); } catch (e) { console.error(e); }
+    };
+    const handleDelete = async (id) => { try { await deleteDoc(doc(db,`artifacts/${appId}/public/data/shops`,id));}catch(e){console.error(e);}};
+    const handleKeyPress = (e) => { if (e.key === 'Enter') { handleAdd(); }};
+    return (<div className="bg-white p-6 rounded-lg shadow-md"><div className="flex items-center gap-3 mb-4"><div className="text-blue-600"><Store /></div><h3 className="text-xl font-bold">Shops</h3></div><ul className="space-y-2 mb-4 h-40 overflow-y-auto pr-2">{shops.map(shop => (<li key={shop.id} className="flex justify-between items-center bg-gray-100 p-2 rounded-md"><div><span>{shop.name}</span> <span className="text-xs text-gray-500">({shop.saleMargin || 0}%)</span></div><button onClick={() => handleDelete(shop.id)} className="text-red-500 hover:text-red-700"><Trash2 size={16}/></button></li>))}{shops.length === 0 && <p className="text-center text-gray-500 text-sm py-2">No shops added.</p>}</ul><div className="flex flex-col gap-2"><input type="text" value={newItem.name} onChange={e => setNewItem(prev=>({...prev, name: e.target.value}))} onKeyPress={handleKeyPress} placeholder="New Shop Name" className="w-full p-2 border rounded-md" /><input type="number" value={newItem.saleMargin} onChange={e => setNewItem(prev => ({...prev, saleMargin: e.target.value}))} onKeyPress={handleKeyPress} placeholder="Sale Margin (%)" className="w-full p-2 border rounded-md" /><button onClick={handleAdd} className="bg-blue-600 text-white p-2 rounded-md hover:bg-blue-700 w-full"><PlusCircle size={20} className="inline-block mr-2"/> Add Shop</button></div></div>);
+}
+
+
+// --- Vendors Page ---
+function VendorsPage({ db, userId, vendors }) {
+    const initialFormState = { name: '', location: '', contact: '', bankName: '', bankUsd: '', bankKhr: '', note: '' };
+    const [newItem, setNewItem] = useState(initialFormState);
+    const [editingVendor, setEditingVendor] = useState(null);
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    
+    const handleChange = (e) => setNewItem({...newItem, [e.target.name]: e.target.value});
+
+    const handleAdd = async (e) => {
+        e.preventDefault();
+        if (newItem.name.trim() === '') { alert("Vendor name is required."); return; }
+        setIsSubmitting(true);
+        try {
+            await addDoc(collection(db,`artifacts/${appId}/public/data/vendors`), { ...newItem, createdAt: new Date(), userId });
+            setNewItem(initialFormState);
+        } catch(e) { console.error(e); alert("Failed to add vendor."); }
+        finally { setIsSubmitting(false); }
+    };
+    
+    const handleDelete = async (id) => {
+        if(window.confirm("Are you sure you want to delete this vendor? This action cannot be undone.")){
+            try { await deleteDoc(doc(db,`artifacts/${appId}/public/data/vendors`,id)); } catch(e) { console.error(e); alert("Failed to delete vendor."); }
+        }
+    };
+    
+    const handleUpdate = async (updatedVendor) => {
+        const {id, ...data} = updatedVendor;
+        try {
+            await updateDoc(doc(db, `artifacts/${appId}/public/data/vendors`, id), data);
+            setEditingVendor(null);
+        } catch(e) { console.error(e); alert("Failed to update vendor."); }
+    }
+
+    return (
+        <>
+            <div className="bg-white p-6 rounded-xl shadow-lg">
+                <h2 className="text-2xl font-bold text-slate-800 mb-6">Manage Vendors</h2>
+                <div className="overflow-x-auto">
+                    <table className="w-full text-left">
+                        <thead className="bg-slate-100">
+                            <tr>
+                                <th className="p-3">No.</th>
+                                <th className="p-3">Vendor Name</th>
+                                <th className="p-3">Location</th>
+                                <th className="p-3">Contact</th>
+                                <th className="p-3">Bank Name</th>
+                                <th className="p-3">Account No ($)</th>
+                                <th className="p-3">Account No (៛)</th>
+                                <th className="p-3">Note</th>
+                                <th className="p-3">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {vendors.map((vendor, index) => (
+                                <tr key={vendor.id} className="border-b hover:bg-slate-50">
+                                    <td className="p-3">{index + 1}</td>
+                                    <td className="p-3 font-semibold">{vendor.name}</td>
+                                    <td className="p-3">{vendor.location}</td>
+                                    <td className="p-3">{vendor.contact}</td>
+                                    <td className="p-3">{vendor.bankName}</td>
+                                    <td className="p-3">{vendor.bankUsd}</td>
+                                    <td className="p-3">{vendor.bankKhr}</td>
+                                    <td className="p-3 text-sm text-slate-600 max-w-xs truncate">{vendor.note}</td>
+                                    <td className="p-3">
+                                        <div className="flex gap-2">
+                                            <button onClick={() => setEditingVendor(vendor)} className="p-1 text-blue-600 hover:text-blue-800"><Edit size={16}/></button>
+                                            <button onClick={() => handleDelete(vendor.id)} className="p-1 text-red-600 hover:text-red-800"><Trash2 size={16}/></button>
+                                        </div>
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                    {vendors.length === 0 && <p className="text-center py-8 text-slate-500">No vendors added yet. Add one below.</p>}
+                </div>
+            </div>
+            <div className="bg-white p-6 rounded-xl shadow-lg mt-8">
+                <h3 className="text-xl font-bold mb-4">Add New Vendor</h3>
+                <form onSubmit={handleAdd} className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 items-start">
+                    <FormInput label="Vendor Name" name="name" value={newItem.name} onChange={handleChange} />
+                    <FormInput label="Store Location" name="location" value={newItem.location} onChange={handleChange} />
+                    <FormInput label="Contact (Tel)" name="contact" value={newItem.contact} onChange={handleChange} />
+                    <FormInput label="Bank Name" name="bankName" value={newItem.bankName} onChange={handleChange} />
+                    <FormInput label="Account No ($)" name="bankUsd" value={newItem.bankUsd} onChange={handleChange} />
+                    <FormInput label="Account No (៛)" name="bankKhr" value={newItem.bankKhr} onChange={handleChange} />
+                    <div className="md:col-span-2 lg:col-span-3">
+                        <label className="block text-sm font-medium text-gray-700 mb-1">Note</label>
+                        <textarea name="note" value={newItem.note} onChange={handleChange} rows="1" className="w-full p-2 border border-gray-300 rounded-md"></textarea>
+                    </div>
+                    <div className="lg:col-span-3 flex justify-end">
+                       <button type="submit" disabled={isSubmitting} className="w-full sm:w-auto bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 disabled:bg-gray-400 flex items-center justify-center gap-2">
+                            <PlusCircle size={20}/> {isSubmitting ? 'Adding...' : 'Add Vendor'}
+                        </button>
+                    </div>
+                </form>
+            </div>
+             <Modal isOpen={!!editingVendor} onClose={() => setEditingVendor(null)} title="Edit Vendor">
+                {editingVendor && <EditVendorForm vendor={editingVendor} onSave={handleUpdate} onClose={() => setEditingVendor(null)} />}
+            </Modal>
+        </>
+    );
+}
+
+function EditVendorForm({ vendor, onSave, onClose }) {
+    const [formData, setFormData] = useState(vendor);
+    const handleChange = (e) => {
+        const { name, value } = e.target;
+        setFormData(prev => ({...prev, [name]: value}));
+    };
+    const handleSave = () => {
+        if (formData.name.trim() === '') {
+            alert("Vendor name is required.");
+            return;
+        }
+        onSave(formData);
+    }
+    return (
+         <div className="space-y-4">
+            <FormInput label="Vendor Name" name="name" value={formData.name} onChange={handleChange} />
+            <FormInput label="Store Location" name="location" value={formData.location} onChange={handleChange} />
+            <FormInput label="Contact (Tel)" name="contact" value={formData.contact} onChange={handleChange} />
+            <FormInput label="Bank Name" name="bankName" value={formData.bankName} onChange={handleChange} />
+            <FormInput label="Account No ($)" name="bankUsd" value={formData.bankUsd} onChange={handleChange} />
+            <FormInput label="Account No (៛)" name="bankKhr" value={formData.bankKhr} onChange={handleChange} />
+            <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Note</label>
+                <textarea name="note" value={formData.note} onChange={handleChange} rows="3" className="w-full p-2 border border-gray-300 rounded-md"></textarea>
+            </div>
+            <div className="flex justify-end gap-4">
+                <button onClick={onClose} className="px-4 py-2 rounded-md bg-gray-200 hover:bg-gray-300">Cancel</button>
+                <button onClick={handleSave} className="px-4 py-2 rounded-md bg-blue-600 text-white hover:bg-blue-700">Save Changes</button>
+            </div>
+        </div>
+    );
+}
+
+// --- Period End Close Page ---
+function PeriodEndClosePage({ db, userId, shops, reports, purchaseOrders, cashExpenses, internalTransfers, monthlyClosures, adjustingEntries, exchangeRate }) {
+    const [selectedYear, setSelectedYear] = useState(new Date().getFullYear());
+    const [selectedMonth, setSelectedMonth] = useState(new Date().getMonth());
+    const [selectedShopId, setSelectedShopId] = useState(shops[0]?.id || 'all');
+    const [actualBalance, setActualBalance] = useState('');
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    const [isStatementGenerated, setIsStatementGenerated] = useState(false);
+    
+    useEffect(() => {
+        setIsStatementGenerated(false);
+        setActualBalance('');
+    }, [selectedYear, selectedMonth, selectedShopId]);
+
+    const periodId = `${selectedYear}-${selectedMonth}-${selectedShopId}`;
+    const closure = useMemo(() => monthlyClosures.find(c => c.id === periodId), [monthlyClosures, periodId]);
+    
+    const calculation = useMemo(() => {
+        const isAllShops = selectedShopId === 'all';
+        const targetShops = isAllShops ? shops : shops.filter(s => s.id === selectedShopId);
+        if (targetShops.length === 0) return null;
+        
+        const prevMonthDate = new Date(selectedYear, selectedMonth - 1);
+        const prevPeriodId = `${prevMonthDate.getFullYear()}-${prevMonthDate.getMonth()}-${selectedShopId}`;
+        const prevClosure = monthlyClosures.find(c => c.id === prevPeriodId);
+        const openingBalance = prevClosure ? prevClosure.closingBalanceKhr : 0;
+        
+        let totalSales = 0, totalPOs = 0, totalExpenses = 0, transfersIn = 0, transfersOut = 0, totalAdjustments = 0;
+        
+        targetShops.forEach(shop => {
+            reports.forEach(r => {
+                const d = r.createdAt.toDate();
+                if (r.shopId === shop.id && d.getFullYear() === selectedYear && d.getMonth() === selectedMonth) totalSales += r.grandTotalKhr;
+            });
+            purchaseOrders.forEach(po => {
+                const d = new Date(po.poDate + 'T00:00:00');
+                if (po.shopId === shop.id && d.getFullYear() === selectedYear && d.getMonth() === selectedMonth) totalPOs += (po.amountUsd * exchangeRate) + po.amountKhr;
+            });
+            cashExpenses.forEach(exp => {
+                const d = new Date(exp.expenseDate + 'T00:00:00');
+                if (exp.shopId === shop.id && d.getFullYear() === selectedYear && d.getMonth() === selectedMonth) totalExpenses += (exp.amountUsd * exchangeRate) + exp.amountKhr;
+            });
+            if (!isAllShops) {
+                internalTransfers.forEach(t => {
+                    const d = new Date(t.transferDate + 'T00:00:00');
+                    if (d.getFullYear() === selectedYear && d.getMonth() === selectedMonth) {
+                        if (t.toShopId === shop.id) transfersIn += (t.amountUsd * exchangeRate) + t.amountKhr;
+                        if (t.fromShopId === shop.id) transfersOut += (t.amountUsd * exchangeRate) + t.amountKhr;
+                    }
+                });
+            }
+            adjustingEntries.forEach(adj => {
+                if (adj.shopId === shop.id && adj.period === `${selectedYear}-${selectedMonth}`) totalAdjustments += adj.amountKhr;
+            });
+        });
+
+        const netCashFlow = totalSales - totalPOs - totalExpenses + transfersIn - transfersOut;
+        const calculatedClosing = openingBalance + netCashFlow + totalAdjustments;
+
+        return {
+            openingBalance, totalSales, totalPOs, totalExpenses, transfersIn, transfersOut, 
+            netCashFlow, totalAdjustments, calculatedClosing
+        };
+    }, [selectedYear, selectedMonth, selectedShopId, shops, reports, purchaseOrders, cashExpenses, internalTransfers, adjustingEntries, monthlyClosures, exchangeRate]);
+
+    const handleFinalizeClose = async () => {
+        if (!calculation) return;
+        const actual = parseFloat(actualBalance);
+        if (isNaN(actual)) { alert("Please enter the actual reconciled balance."); return; }
+
+        const discrepancy = calculation.calculatedClosing - actual;
+        if (Math.abs(discrepancy) > 0.01) {
+            if (!window.confirm(`There is a discrepancy of ${discrepancy.toLocaleString()} ៛. Are you sure you want to add this as a final adjustment and close?`)) return;
+        } else if (!window.confirm("Are you sure you want to finalize and close this period? This action cannot be undone.")) {
+            return;
+        }
+
+        setIsSubmitting(true);
+        try {
+            const batch = writeBatch(db);
+            // Add final adjustment if needed
+            if(Math.abs(discrepancy) > 0.01) {
+                const adjRef = doc(collection(db, `artifacts/${appId}/public/data/adjustingEntries`));
+                batch.set(adjRef, {
+                    period: `${selectedYear}-${selectedMonth}`,
+                    shopId: selectedShopId,
+                    amountKhr: -discrepancy, // Add back the difference to make it match
+                    notes: "Final closing reconciliation adjustment.",
+                    createdAt: new Date(),
+                    createdBy: userId,
+                });
+            }
+
+            // Create the closure document
+            const closureRef = doc(db, `artifacts/${appId}/public/data/monthlyClosures`, periodId);
+            const reportData = {
+                ...calculation,
+                calculatedClosing: actual, // Final closing balance is the actual one
+                overageShortageKhr: -discrepancy
+            };
+            batch.set(closureRef, {
+                status: 'closed',
+                openingBalanceKhr: calculation.openingBalance,
+                closingBalanceKhr: actual,
+                overageShortageKhr: -discrepancy, // if positive, it was a shortage; if negative, an overage
+                closedAt: new Date(),
+                closedBy: userId,
+                reportData,
+            });
+            await batch.commit();
+            setActualBalance('');
+
+        } catch (e) {
+            console.error("Error closing period:", e);
+            alert("Failed to close period. See console for details.");
+        } finally {
+            setIsSubmitting(false);
+        }
+    };
+
+    const years = [...new Set(reports.map(r => r.createdAt.toDate().getFullYear()))].sort((a,b) => b-a);
+    if(years.length === 0) years.push(new Date().getFullYear());
+    const months = Array.from({length: 12}, (e, i) => new Date(null, i, 1).toLocaleDateString("en", {month: "long"}));
+    const selectedShopName = shops.find(s => s.id === selectedShopId)?.name || 'All Shops';
+
+    return (
+        <div className="space-y-6">
+            <div className="bg-white p-6 rounded-xl shadow-lg">
+                <h2 className="text-2xl font-bold text-slate-800">Period-End Close</h2>
+                <p className="text-slate-500 mb-6">Finalize and lock financial data for a specific period.</p>
+                <div className="flex flex-wrap gap-4 mb-6 p-4 bg-slate-50 rounded-lg items-end">
+                     <FormSelect label="Year" name="year" value={selectedYear} onChange={e => setSelectedYear(parseInt(e.target.value))} options={years} />
+                     <FormSelect label="Month" name="month" value={selectedMonth} onChange={e => setSelectedMonth(parseInt(e.target.value))} options={months.map((m,i) => i)} optionLabels={months} />
+                     <FormSelect label="Shop" name="shopId" value={selectedShopId} onChange={e => setSelectedShopId(e.target.value)} options={['all', ...shops.map(s => s.id)]} optionLabels={['All Shops', ...shops.map(s => s.name)]} />
+                </div>
+                 <div className="mt-6 flex justify-center">
+                    <button
+                      onClick={() => setIsStatementGenerated(true)}
+                      disabled={!selectedShopId || isStatementGenerated}
+                      className="bg-blue-600 text-white font-bold py-3 px-6 rounded-lg hover:bg-blue-700 disabled:bg-gray-400 text-lg transition-all"
+                    >
+                      Generate Statement for {months[selectedMonth]} {selectedYear}
+                    </button>
+                </div>
+            </div>
+
+           {isStatementGenerated && (
+            <div className="mt-8">
+                {closure ? (
+                     <div className="bg-white p-6 rounded-xl shadow-lg">
+                        <h3 className="text-xl font-bold text-green-600 mb-2">Period Closed</h3>
+                        <p className="mb-4 text-slate-600">This period for **{selectedShopName}** was closed on {closure.closedAt.toDate().toLocaleString()}. The data is now read-only.</p>
+                        <StatementOfCashFlow report={closure.reportData} />
+                     </div>
+                ) : calculation ? (
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                        <div className="bg-white p-6 rounded-xl shadow-lg">
+                            <h3 className="text-xl font-bold mb-4">Statement of Monthly Cash Flow</h3>
+                            <StatementOfCashFlow report={calculation} />
+                        </div>
+                         <div className="bg-white p-6 rounded-xl shadow-lg space-y-6">
+                            <h3 className="text-xl font-bold">Reconciliation & Finalization</h3>
+                            <div>
+                                <FormInput label="Actual Reconciled Balance (៛)" type="number" name="actualBalance" value={actualBalance} onChange={e => setActualBalance(e.target.value)} />
+                                <p className="text-xs text-slate-500 mt-1">Enter the total cash from physical count and bank statements.</p>
+                            </div>
+                            {actualBalance && (
+                                <div className={`p-4 rounded-lg ${Math.abs(calculation.calculatedClosing - parseFloat(actualBalance)) > 0.01 ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-200'} border`}>
+                                    <p className="font-semibold">Discrepancy</p>
+                                    <p className={`text-2xl font-bold ${Math.abs(calculation.calculatedClosing - parseFloat(actualBalance)) > 0.01 ? 'text-red-600' : 'text-green-600'}`}>
+                                        {(calculation.calculatedClosing - parseFloat(actualBalance)).toLocaleString('en-US', {minimumFractionDigits:2})} ៛
+                                    </p>
+                                    <p className="text-xs">{calculation.calculatedClosing > parseFloat(actualBalance) ? 'System shows more cash than actual (Shortage).' : 'Actual cash is more than system calculation (Overage).'}</p>
+                                </div>
+                            )}
+                            <div>
+                                <button onClick={handleFinalizeClose} disabled={isSubmitting || !actualBalance} className="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 disabled:bg-gray-400 flex items-center justify-center gap-2">
+                                    <Archive size={20}/>
+                                    {isSubmitting ? 'Closing...' : 'Finalize and Close Month'}
+                                </button>
+                                <p className="text-xs text-center mt-2 text-slate-500 flex items-center justify-center gap-2"><AlertTriangle size={14}/> This action is irreversible.</p>
+                            </div>
+                         </div>
+                    </div>
+                ) : <p>Select a shop to begin.</p>}
+            </div>
+           )}
+        </div>
+    )
+}
+
+function StatementOfCashFlow({ report }) {
+    if (!report) return null;
+    return (
+        <div className="space-y-4">
+            <h4 className="font-bold text-lg">Cash Flow Statement</h4>
+            <div className="space-y-2 border-b pb-2">
+                <SummaryRow label="Opening Balance" value={`${report.openingBalance.toLocaleString('en-US', {minimumFractionDigits: 2})} ៛`} />
+            </div>
+             <h5 className="font-semibold pt-2">Operating Activities</h5>
+            <div className="space-y-2 pl-4 border-b pb-2">
+                <SummaryRow label="Cash Inflows (Sales)" value={`+ ${report.totalSales.toLocaleString('en-US', {minimumFractionDigits: 2})} ៛`} isPositive={true}/>
+                <SummaryRow label="Cash Outflows (Purchase Orders)" value={`- ${report.totalPOs.toLocaleString('en-US', {minimumFractionDigits: 2})} ៛`} />
+                <SummaryRow label="Cash Outflows (Expenses)" value={`- ${report.totalExpenses.toLocaleString('en-US', {minimumFractionDigits: 2})} ៛`} />
+            </div>
+             <h5 className="font-semibold pt-2">Other Activities</h5>
+             <div className="space-y-2 pl-4 border-b pb-2">
+                <SummaryRow label="Internal Transfers In" value={`+ ${report.transfersIn.toLocaleString('en-US', {minimumFractionDigits: 2})} ៛`} isPositive={true}/>
+                <SummaryRow label="Internal Transfers Out" value={`- ${report.transfersOut.toLocaleString('en-US', {minimumFractionDigits: 2})} ៛`} />
+                <SummaryRow label="Adjustments" value={`${report.totalAdjustments > 0 ? '+':''}${report.totalAdjustments.toLocaleString('en-US', {minimumFractionDigits: 2})} ៛`} isPositive={report.totalAdjustments >=0} />
+                 {report.overageShortageKhr && <SummaryRow label="Final Closing Adjustment" value={`${report.overageShortageKhr > 0 ? '+':''}${report.overageShortageKhr.toLocaleString('en-US', {minimumFractionDigits: 2})} ៛`} isPositive={report.overageShortageKhr >=0}/>}
+            </div>
+            <div className="pt-4">
+                <div className="flex justify-between items-center bg-slate-100 p-3 rounded-lg">
+                    <p className="font-bold text-lg">Calculated Closing Balance</p>
+                    <p className="font-bold text-lg">{report.calculatedClosing.toLocaleString('en-US', {minimumFractionDigits: 2})} ៛</p>
+                </div>
+            </div>
+        </div>
+    )
+}
+
+
+// --- Reusable Form Components ---
+function FormInput({ label, type, name, value, onChange, disabled=false }) {
+    return (<div className="w-full"><label className="block text-sm font-medium text-gray-700 mb-1">{label}</label><input type={type} name={name} value={value || ''} onChange={onChange} disabled={disabled} className="w-full p-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100" step="any"/></div>);
+}
+function FormSelect({ label, name, value, onChange, options, optionLabels, disabled=false }) {
+    return (<div className="w-full"><label className="block text-sm font-medium text-gray-700 mb-1">{label}</label><select name={name} value={value} onChange={onChange} disabled={disabled} className="w-full p-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500 bg-white disabled:bg-gray-100">{options.length===0&&<option>No options available</option>}{options.map((opt, i) => <option key={opt} value={opt}>{optionLabels ? optionLabels[i] : opt}</option>)}</select></div>);
+}
+function SummaryRow({ label, value, isPositive }) {
+    const valueColor = isPositive === undefined ? '' : isPositive ? 'text-green-600' : 'text-red-600';
+    return (<div className="flex justify-between items-center text-sm"><p className="text-gray-600">{label}</p><p className={`font-semibold font-mono ${valueColor}`}>{value}</p></div>);
+}
